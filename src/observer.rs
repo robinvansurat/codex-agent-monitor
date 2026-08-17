@@ -332,6 +332,7 @@ fn canonicalize_path(value: &str) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
 fn strip_verbatim_prefix(value: &str) -> String {
     let unc = r"\\?\UNC\";
     let verbatim = r"\\?\";
