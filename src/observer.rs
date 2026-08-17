@@ -386,10 +386,7 @@ fn normalize_path(path: &Path) -> String {
         })
         .collect::<Vec<_>>();
     if components.first().is_some_and(String::is_empty) {
-        format!(
-            "/{}",
-            components.iter().skip(1).collect::<Vec<_>>().join("/")
-        )
+        format!("/{}", components[1..].join("/"))
     } else {
         components.join("/")
     }
