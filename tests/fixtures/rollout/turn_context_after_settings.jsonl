@@ -1,0 +1,2 @@
+{"timestamp":1720000005,"type":"thread_settings_applied","payload":{"thread_id":"thread-b","model":"gpt-4.2","reasoning_effort":"low"}}
+{"type":"event_msg","payload":{"type":"turn_context","thread_id":"thread-b","model":"gpt-4.5","reasoningEffort":"medium"}}

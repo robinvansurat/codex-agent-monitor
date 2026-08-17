@@ -1,0 +1,7 @@
+{"timestamp":1720010000,"type":"session_meta","payload":{"id":"fork-child","nickname":"child","agent_type":"assistant","parent_thread_id":"child-parent"}}
+{"timestamp":1720009900,"type":"task_complete","payload":{"thread_id":"fork-child","status":"error","error":null}}
+{"timestamp":1720009850,"type":"turn_context","payload":{"thread_id":"fork-child","model":"copy-model","reasoningEffort":"low"}}
+{"timestamp":1720009990,"type":"tool_call","payload":{"toolName":"copied_tool","status":"done","thread_id":"fork-child"}}
+{"timestamp":1720010010,"type":"task_started","payload":{"thread_id":"fork-child"}}
+{"timestamp":1720010015,"type":"tool_call","payload":{"tool":{"name":"child_tool"},"status":"done","thread_id":"fork-child"}}
+{"timestamp":1720010020,"type":"turn_context","payload":{"thread_id":"fork-child","model":"child-model","reasoningEffort":"high"}}

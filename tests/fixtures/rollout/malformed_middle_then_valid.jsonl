@@ -1,0 +1,4 @@
+{"type":"task_started","payload":{"thread_id":"thread-middle","id":"thread-middle","timestamp":1720000600}}
+{"type":"thread_settings_applied","payload":{"thread_id":"thread-middle","id":"thread-middle","model":"gpt-2","reasoningEffort":"low","timestamp":1720000601}
+{"type":"task_complete","payload":{"thread_id":"thread-middle","id":"thread-middle","error":null,"timestamp":1720000602}}
+{"type":"event_msg","timestamp":1720000603,"payload":{"type":"turn_context","thread_id":"thread-middle","id":"thread-middle","model":"gpt-3.1","reasoningEffort":"high"}}

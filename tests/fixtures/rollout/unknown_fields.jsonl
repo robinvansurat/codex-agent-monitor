@@ -1,0 +1,3 @@
+{"timestamp":1720000010,"type":"task_started","thread_id":"thread-d","payload":{"thread_id":"thread-d"}}
+{"timestamp":1720000011,"type":"thread_settings_applied","thread_id":"thread-d","extra_meta":{"foo":"bar"},"payload":{"thread_settings":{"model":"gpt-4","reasoningEffort":"low"}}}
+{"timestamp":1720000012,"type":"event_msg","thread_id":"thread-d","payload":{"type":"turn_context","thread_id":"thread-d","model":"gpt-4","reasoningEffort":"high","extra":{"thread_id":"thread-d"}}}
