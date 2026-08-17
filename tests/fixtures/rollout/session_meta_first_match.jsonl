@@ -1,0 +1,3 @@
+{"timestamp":1720000700,"type":"session_meta","payload":{"id":"child","nickname":"FirstNick","role":"FirstRole","parent_thread_id":"first-parent","agent_path":"/first/path"}}
+{"timestamp":1720000701,"type":"session_meta","payload":{"id":"other","nickname":"IgnoredNick","role":"IgnoredRole","parent_thread_id":"other-parent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"source-parent"}}}}
+{"timestamp":1720000702,"type":"session_meta","payload":{"id":"child","nickname":"LaterNick","role":"LaterRole","parent_thread_id":"later-parent","agent_path":"/later/path"}}

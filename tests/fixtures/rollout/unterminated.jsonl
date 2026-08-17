@@ -1,0 +1,2 @@
+{"type":"task_started","payload":{"thread_id":"thread-clean","id":"thread-clean","timestamp":1720000550}}
+{"type":"thread_settings_applied","payload":{"thread_id":"thread-clean","id":"thread-clean","model":"gpt-4.2","reasoningEffort":"high","timestamp":1720000551}}

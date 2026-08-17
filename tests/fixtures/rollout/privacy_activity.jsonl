@@ -1,0 +1,2 @@
+{"timestamp":1720000014,"type":"tool_call","payload":{"tool":{"name":"bash","input":"SECRET_INPUT","output":"SECRET_OUTPUT","result":"SECRET_RESULT"},"status":"done"}}
+{"timestamp":1720000015,"type":"event_msg","payload":{"type":"tool_call","tool_name":"python","arguments":"SECRET_ARGS","results":"SECRET_RESULTS"}}

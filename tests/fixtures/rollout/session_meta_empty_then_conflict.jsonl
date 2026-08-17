@@ -1,0 +1,2 @@
+{"timestamp":1720009000,"type":"session_meta","payload":{"id":"child-empty","thread_id":"child-empty"}}
+{"timestamp":1720009001,"type":"session_meta","payload":{"id":"child-empty","nickname":"LaterNick","role":"later-role","parent_thread_id":"later-parent","agent_path":"/later/path"}}
