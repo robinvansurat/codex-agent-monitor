@@ -1,5 +1,7 @@
-use std::io;
-use std::time::{Duration, Instant};
+use chrono::{DateTime, Duration, Utc};
+use std::path::Path;
+use std::time::{Duration as StdDuration, Instant};
+use std::{io, io::Write};
 
 use anyhow::{bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -10,16 +12,113 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph, Wrap},
+    Frame,
 };
 
 use crate::cli::FilterOpts;
-use crate::model::ThreadTreeNode;
+use crate::model::{ThreadSnapshot, ThreadState, ThreadTreeNode};
 use crate::observer::Monitor;
 use crate::runtime::RuntimeOverlay;
+
+const REFRESH_INTERVAL_MS: u64 = 1000;
+const HISTORY_LIMIT: usize = 10;
+const SHORT_ID_LEN: usize = 8;
+const AGENT_CARD_LINES: usize = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateBucket {
+    Running,
+    Idle,
+    Done,
+    Failed,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalStateFilter {
+    All,
+    Running,
+    IdleOrDone,
+    Failed,
+}
+
+impl LocalStateFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Running,
+            Self::Running => Self::IdleOrDone,
+            Self::IdleOrDone => Self::Failed,
+            Self::Failed => Self::All,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Running => "Running",
+            Self::IdleOrDone => "Idle/Done",
+            Self::Failed => "Failed",
+        }
+    }
+
+    fn matches(self, bucket: StateBucket) -> bool {
+        match self {
+            Self::All => true,
+            Self::Running => matches!(bucket, StateBucket::Running),
+            Self::IdleOrDone => matches!(bucket, StateBucket::Idle | StateBucket::Done),
+            Self::Failed => matches!(bucket, StateBucket::Failed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TuiState {
+    selected: usize,
+    selected_thread_id: Option<String>,
+    search_query: String,
+    search_mode: bool,
+    state_filter: LocalStateFilter,
+    show_activity: bool,
+    show_technical: bool,
+    show_help: bool,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            selected: 0,
+            selected_thread_id: None,
+            search_query: String::new(),
+            search_mode: false,
+            state_filter: LocalStateFilter::All,
+            show_activity: false,
+            show_technical: false,
+            show_help: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ListRow {
+    thread_id: String,
+    state: ThreadState,
+    depth: usize,
+    display_name: String,
+    short_id: String,
+    model: String,
+    effort: String,
+    origin_label: String,
+    state_label: String,
+    state_bucket: StateBucket,
+    age_label: String,
+    role: String,
+    nickname: String,
+    cwd: String,
+}
 
 pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
     if matches!(filters.runtime_events.as_deref(), Some("-")) {
@@ -27,118 +126,1003 @@ pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
     }
 
     let mut state = TuiState::new();
-    state.refresh_interval_ms = 1000;
     let mut _guard = TerminalGuard::enter()?;
+    let mut force_refresh = true;
+    let mut next_refresh_at = Instant::now();
+    let mut last_refresh_at = Utc::now();
+    let mut snapshot: Option<crate::model::ProbeOutput> = None;
+    let mut all_rows: Vec<ListRow> = Vec::new();
     loop {
         let now = Instant::now();
-        let runtime = RuntimeOverlay::from_source(filters.runtime_events.as_deref());
-        let snapshot = monitor.probe_snapshot(filters, runtime, false)?;
-
-        let mut nodes = Vec::new();
-        for node in &snapshot.tree {
-            collect_tree_nodes(node, 0, &snapshot.threads, &mut nodes);
-        }
-        if nodes.is_empty() {
-            state.selected = 0;
-        } else if state.selected >= nodes.len() {
-            state.selected = nodes.len().saturating_sub(1);
-        }
-
-        _guard.terminal.draw(|frame| {
-            let size = frame.area();
-            let root = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([Constraint::Length(3), Constraint::Min(0)])
-                .split(size);
-            let header = Paragraph::new(
-                "q quit, j/k or arrows move, Enter toggle details, r refresh manually",
-            )
-            .alignment(Alignment::Left)
-            .style(Style::default().fg(Color::Cyan))
-            .block(Block::default().borders(Borders::ALL).title("Help"));
-            frame.render_widget(header, root[0]);
-
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(root[1]);
-
-            let list_lines: Vec<Line> = nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, (thread_id, depth))| {
-                    let thread = snapshot
-                        .threads
+        if force_refresh || now >= next_refresh_at {
+            let runtime = RuntimeOverlay::from_source(filters.runtime_events.as_deref());
+            let snap = monitor.probe_snapshot(filters, runtime, false)?;
+            let now = Utc::now();
+            last_refresh_at = now;
+            let mut nodes = Vec::new();
+            for node in &snap.tree {
+                collect_tree_nodes(node, 0, &snap.threads, &mut nodes);
+            }
+            all_rows = nodes
+                .into_iter()
+                .filter_map(|(thread_id, depth)| {
+                    snap.threads
                         .iter()
-                        .find(|t| t.thread_id == *thread_id)?;
-                    let prefix = if idx == state.selected { ">" } else { " " };
-                    let indent = "  ".repeat(*depth);
-                    let marker = match thread.state {
-                        crate::model::ThreadState::Running => "R",
-                        crate::model::ThreadState::Idle => "I",
-                        crate::model::ThreadState::Interrupted => "X",
-                        crate::model::ThreadState::Failed => "F",
-                        crate::model::ThreadState::Done => "D",
-                        crate::model::ThreadState::Unknown => "?",
-                    };
-                    Some(Line::from(format!(
-                        "{} [{}] {}{}",
-                        prefix, marker, indent, thread.thread_id
-                    )))
+                        .find(|t| t.thread_id == thread_id)
+                        .map(|thread| build_list_row(thread, depth, now))
                 })
                 .collect();
-            frame.render_widget(
-                Paragraph::new(list_lines)
-                    .wrap(Wrap { trim: true })
-                    .block(Block::default().borders(Borders::ALL).title("Threads")),
-                body[0],
-            );
+            snapshot = Some(snap);
+            next_refresh_at = Instant::now() + StdDuration::from_millis(REFRESH_INTERVAL_MS);
+            force_refresh = false;
+        }
 
-            let details = if let Some((thread_id, _)) = nodes.get(state.selected) {
-                render_details(
-                    snapshot.threads.iter().find(|t| &t.thread_id == thread_id),
-                    state.show_details,
-                )
-            } else {
-                Paragraph::new("No thread selected")
-                    .block(Block::default().borders(Borders::ALL).title("Details"))
-            };
-            frame.render_widget(details, body[1]);
+        let Some(active_snapshot) = snapshot.as_ref() else {
+            continue;
+        };
+
+        let visible_rows: Vec<ListRow> = all_rows
+            .iter()
+            .filter(|row| {
+                matches_filter_query(row, &state.search_query)
+                    && state.state_filter.matches(row.state_bucket)
+            })
+            .cloned()
+            .collect();
+
+        if visible_rows.is_empty() {
+            state.selected = 0;
+            state.selected_thread_id = None;
+        } else if let Some(selected_thread_id) = state.selected_thread_id.clone() {
+            state.selected = visible_rows
+                .iter()
+                .position(|row| row.thread_id == selected_thread_id)
+                .unwrap_or_else(|| state.selected.min(visible_rows.len().saturating_sub(1)));
+        } else if state.selected >= visible_rows.len() {
+            state.selected = visible_rows.len().saturating_sub(1);
+        }
+
+        if let Some(selected) = visible_rows.get(state.selected) {
+            state.selected_thread_id = Some(selected.thread_id.clone());
+        } else {
+            state.selected_thread_id = None;
+        }
+
+        let selected_snapshot = state.selected_thread_id.as_deref().and_then(|thread_id| {
+            active_snapshot
+                .threads
+                .iter()
+                .find(|t| t.thread_id == thread_id)
+        });
+
+        let status_span = format_time_delta(Some(last_refresh_at), Utc::now());
+        let counts = count_buckets(&all_rows);
+
+        _guard.terminal.draw(|frame| {
+            render_tui_view(
+                frame,
+                frame.area(),
+                &TuiViewState {
+                    visible_rows: &visible_rows,
+                    selected_snapshot,
+                    counts: &counts,
+                    selected: state.selected,
+                    state_filter: &state.state_filter,
+                    last_refresh_label: status_span.as_str(),
+                    show_activity: state.show_activity,
+                    show_technical: state.show_technical,
+                    show_help: state.show_help,
+                    search_mode: state.search_mode,
+                    search_query: &state.search_query,
+                },
+            );
         })?;
 
-        let timeout = Duration::from_millis(100);
+        let timeout = if state.search_mode {
+            StdDuration::from_millis(100)
+        } else {
+            let remaining = next_refresh_at.saturating_duration_since(Instant::now());
+            std::cmp::min(remaining, StdDuration::from_millis(100))
+        };
         if event::poll(timeout)? {
             if let Event::Key(KeyEvent {
                 code, modifiers, ..
             }) = event::read()?
             {
-                match code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('r') | KeyCode::F(5) => {}
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        state.selected = state.selected.saturating_add(1)
+                if state.search_mode {
+                    match code {
+                        KeyCode::Esc => {
+                            state.search_mode = false;
+                            state.search_query.clear();
+                        }
+                        KeyCode::Enter => {
+                            state.search_mode = false;
+                        }
+                        KeyCode::Backspace => {
+                            state.search_query.pop();
+                        }
+                        KeyCode::Char(c) if !c.is_control() => {
+                            state.search_query.push(c);
+                        }
+                        KeyCode::Char('?') => {
+                            state.show_help = true;
+                            state.search_mode = false;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.selected = state.selected.saturating_sub(1)
+                } else {
+                    match code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('r') | KeyCode::F(5) => {
+                            force_refresh = true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            state.selected = state.selected.saturating_add(1);
+                            if state.selected >= visible_rows.len() {
+                                state.selected = visible_rows.len().saturating_sub(1);
+                            }
+                            if let Some(selected) = visible_rows.get(state.selected) {
+                                state.selected_thread_id = Some(selected.thread_id.clone());
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.selected = state.selected.saturating_sub(1);
+                            if let Some(selected) = visible_rows.get(state.selected) {
+                                state.selected_thread_id = Some(selected.thread_id.clone());
+                            }
+                        }
+                        KeyCode::Char('/') => {
+                            state.search_query.clear();
+                            state.search_mode = true;
+                            state.show_help = false;
+                        }
+                        KeyCode::Char('f') => {
+                            state.state_filter = state.state_filter.next();
+                        }
+                        KeyCode::Char('i') => {
+                            state.show_technical = !state.show_technical;
+                        }
+                        KeyCode::Char('?') => {
+                            state.show_help = !state.show_help;
+                        }
+                        KeyCode::Enter => {
+                            state.show_activity = !state.show_activity;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Enter => state.show_details = !state.show_details,
-                    _ => {}
-                }
-                let max = nodes.len().saturating_sub(1);
-                if state.selected > max {
-                    state.selected = max;
                 }
             }
+        } else if Instant::now() >= next_refresh_at {
+            force_refresh = true;
         }
-        let elapsed = now.elapsed();
-        if elapsed < Duration::from_millis(state.refresh_interval_ms) {
-            std::thread::sleep(Duration::from_millis(state.refresh_interval_ms) - elapsed);
+
+        if force_refresh {
+            next_refresh_at = Instant::now();
         }
     }
 
     Ok(())
+}
+
+fn list_scroll_offset(
+    selected_row: usize,
+    visible_rows: usize,
+    row_lines: usize,
+    viewport_lines: usize,
+) -> u16 {
+    if visible_rows == 0 || row_lines == 0 || viewport_lines == 0 {
+        return 0;
+    }
+
+    let total_lines = visible_rows.saturating_mul(row_lines);
+    if total_lines <= viewport_lines {
+        return 0;
+    }
+
+    let max_offset = total_lines.saturating_sub(viewport_lines);
+    let row_top = selected_row.saturating_mul(row_lines);
+
+    row_top.min(max_offset) as u16
+}
+
+struct TuiViewState<'a> {
+    visible_rows: &'a [ListRow],
+    selected_snapshot: Option<&'a ThreadSnapshot>,
+    counts: &'a StateCounts,
+    selected: usize,
+    state_filter: &'a LocalStateFilter,
+    last_refresh_label: &'a str,
+    show_activity: bool,
+    show_technical: bool,
+    show_help: bool,
+    search_mode: bool,
+    search_query: &'a str,
+}
+
+fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_>) {
+    let is_wide = size.width >= 100;
+    let header_height = if is_wide { 3 } else { 4 };
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(size);
+
+    render_header(
+        frame,
+        outer[0],
+        render_state.counts,
+        render_state.last_refresh_label,
+        is_wide,
+    );
+
+    let body = if is_wide {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(outer[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(outer[1])
+    };
+
+    render_agents_pane(
+        frame,
+        body[0],
+        render_state.visible_rows,
+        render_state.selected,
+    );
+
+    if render_state.show_help {
+        frame.render_widget(render_help(), body[1]);
+    } else if let Some(selected) = render_state.selected_snapshot {
+        render_details_pane(
+            frame,
+            body[1],
+            selected,
+            render_state.show_activity,
+            render_state.show_technical,
+            is_wide,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("No thread selected")
+                .block(Block::default().borders(Borders::ALL).title("Details")),
+            body[1],
+        );
+    }
+
+    let footer = render_footer(
+        render_state.search_mode,
+        render_state.search_query,
+        render_state.state_filter,
+        outer[2].width.saturating_sub(2),
+    );
+    frame.render_widget(footer, outer[2]);
+}
+
+fn render_header(
+    frame: &mut Frame,
+    area: Rect,
+    counts: &StateCounts,
+    last_refresh: &str,
+    is_wide: bool,
+) {
+    let border = Block::default().borders(Borders::ALL);
+    let inner = border.inner(area);
+    frame.render_widget(border, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let title = Line::from(Span::styled(
+        "Codex Agent Monitor",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let status_line = Line::from(vec![
+        Span::styled("RUNNING ", Style::default().fg(Color::Green)),
+        Span::styled(format!("{}  ", counts.running), Style::default()),
+        Span::styled("IDLE ", Style::default().fg(Color::Rgb(255, 172, 51))),
+        Span::styled(format!("{}  ", counts.idle), Style::default()),
+        Span::styled("DONE ", Style::default().fg(Color::Gray)),
+        Span::styled(format!("{}  ", counts.done), Style::default()),
+        Span::styled("FAILED ", Style::default().fg(Color::Red)),
+        Span::styled(format!("{}", counts.failed), Style::default()),
+    ]);
+
+    if is_wide {
+        let refresh = Line::from(Span::styled(
+            format!("Auto-refresh • {}", last_refresh),
+            Style::default().fg(Color::DarkGray),
+        ));
+        let row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(46),
+                Constraint::Percentage(20),
+            ])
+            .split(inner);
+        frame.render_widget(Paragraph::new(title), row[0]);
+        frame.render_widget(Paragraph::new(status_line), row[1]);
+        frame.render_widget(Paragraph::new(refresh).alignment(Alignment::Right), row[2]);
+        return;
+    }
+
+    let lines = vec![
+        title,
+        status_line,
+        Line::from(format!(
+            "Updated: {}  •  Auto-refresh {}ms",
+            last_refresh, REFRESH_INTERVAL_MS
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_footer(
+    search_mode: bool,
+    query: &str,
+    state_filter: &LocalStateFilter,
+    width: u16,
+) -> Paragraph<'static> {
+    let (title, footer_text) =
+        footer_text_for_width(search_mode, query, state_filter.label(), width as usize);
+
+    let style = if search_mode {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+
+    Paragraph::new(footer_text)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .alignment(Alignment::Left)
+        .style(style)
+}
+
+fn footer_text_for_width(
+    search_mode: bool,
+    query: &str,
+    filter_label: &str,
+    width: usize,
+) -> (String, String) {
+    if search_mode {
+        return footer_search_text_for_width(query, width);
+    }
+
+    let long = format!(
+        "↑↓ Move  Enter More  / Search  f Filter:{filter_label}  r Refresh  i Details  ? Help  q Quit"
+    );
+    if long.chars().count() <= width {
+        return (String::new(), long);
+    }
+
+    let medium = format!("↑↓ Move  Enter More  / Search  f Filter:{filter_label}  q Quit");
+    if medium.chars().count() <= width {
+        return ("".to_string(), medium);
+    }
+
+    let narrow = "↑↓ / Search  f q Quit".to_string();
+    if narrow.chars().count() <= width {
+        return ("".to_string(), narrow);
+    }
+
+    ("".to_string(), "q Quit".to_string())
+}
+
+fn footer_search_text_for_width(query: &str, width: usize) -> (String, String) {
+    let title = "Search".to_string();
+    let suffix = "  Enter apply  Esc cancel";
+    if width == 0 {
+        return (title, String::new());
+    }
+
+    let suffix_width = suffix.chars().count();
+    if width <= suffix_width {
+        return (title, truncate_by_chars(suffix, width));
+    }
+
+    let available_for_query = width.saturating_sub(suffix.chars().count() + 2);
+    let query = if available_for_query == 0 {
+        "".to_string()
+    } else if query.chars().count() <= available_for_query {
+        query.to_string()
+    } else {
+        format!(
+            "{}…",
+            truncate_by_chars(query, available_for_query.saturating_sub(1))
+        )
+    };
+    let prefix = format!("/ {query}");
+    (title, format!("{prefix}{suffix}"))
+}
+
+fn truncate_by_chars(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    value.chars().take(width).collect()
+}
+
+fn render_help() -> Paragraph<'static> {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Keyboard controls",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+        )),
+        Line::from("q / Esc / Ctrl-C: quit"),
+        Line::from("j, k, ↑, ↓: move selection"),
+        Line::from("/: enter search mode"),
+        Line::from("f: cycle local state filter (All → Running → Idle/Done → Failed → All)"),
+        Line::from("r or F5: refresh now"),
+        Line::from("Enter: toggle recent activity"),
+        Line::from("i: toggle technical details"),
+        Line::from("?: hide help"),
+    ];
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .style(Style::default().fg(Color::Cyan))
+}
+
+fn render_agents_pane(frame: &mut Frame, area: Rect, rows: &[ListRow], selected: usize) {
+    let list_block = Block::default().borders(Borders::ALL).title("Agents");
+    let list_inner = list_block.inner(area);
+    frame.render_widget(list_block, area);
+
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No threads").alignment(Alignment::Center),
+            list_inner,
+        );
+        return;
+    }
+
+    let viewport_rows = list_inner.height as usize;
+    let scroll_offset = list_scroll_offset(selected, rows.len(), AGENT_CARD_LINES, viewport_rows);
+    let first_visible = (scroll_offset as usize) / AGENT_CARD_LINES;
+    let start_y = list_inner.y;
+    let mut y = start_y;
+    for (idx, row) in rows.iter().enumerate().skip(first_visible) {
+        let card_top = (idx - first_visible) as u16 * AGENT_CARD_LINES as u16;
+        let remaining = list_inner.height.saturating_sub(card_top);
+        if remaining == 0 {
+            break;
+        }
+        let card_height = AGENT_CARD_LINES.min(remaining as usize) as u16;
+        let card_area = Rect::new(list_inner.x, y, list_inner.width, card_height);
+        render_agent_card(frame, card_area, row, idx == selected);
+        y = y.saturating_add(card_height);
+    }
+}
+
+fn render_agent_card(frame: &mut Frame, area: Rect, row: &ListRow, is_selected: bool) {
+    let mut lines: Vec<Line> = Vec::new();
+    let state_style = state_style(row.state.clone(), row.state_bucket);
+    let state_text = human_state_label(&row.state_label);
+
+    let prefix = tree_indent(row.depth);
+    let title = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+        Span::styled("● ", state_style),
+        Span::styled(
+            row.display_name.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    lines.push(title);
+
+    lines.push(Line::from(vec![
+        Span::styled(state_text, state_style),
+        Span::raw(format!(" • {}", row.age_label)),
+    ]));
+
+    lines.push(Line::from(vec![Span::styled(
+        format!("{} • {}", row.model, row.effort),
+        Style::default(),
+    )]));
+
+    lines.push(Line::from(Span::styled(
+        row.origin_label.clone(),
+        Style::default(),
+    )));
+
+    while lines.len() < AGENT_CARD_LINES.saturating_sub(1) {
+        lines.push(Line::from(" "));
+    }
+
+    let border_style = if is_selected {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = if is_selected {
+        Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .border_style(border_style)
+    } else {
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .padding(Padding::horizontal(1))
+            .border_style(border_style)
+    };
+    if !is_selected && lines.len() < AGENT_CARD_LINES {
+        lines.push(Line::from(" "));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(block),
+        area,
+    );
+}
+
+fn render_details_pane(
+    frame: &mut Frame,
+    area: Rect,
+    selected: &ThreadSnapshot,
+    show_activity: bool,
+    show_technical: bool,
+    is_wide: bool,
+) {
+    let panel = Block::default().borders(Borders::ALL).title("Details");
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
+
+    if inner.height < 2 || inner.width < 2 {
+        return;
+    }
+
+    let (model, effort) = preferred_model_and_effort(selected);
+    let (origin, cwd_path) = origin_label(selected.cwd.as_deref());
+    let state_text = human_state_label(
+        state_label(selected.state.clone(), selected.state_detail.as_deref()).as_str(),
+    );
+    let age = format_time_delta(last_update_for_thread(selected), Utc::now());
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        display_name(selected),
+        Style::default().add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            state_text,
+            state_style(
+                selected.state.clone(),
+                bucket_for_state(selected.state.clone(), selected.state_detail.as_deref()),
+            ),
+        ),
+        Span::styled(format!(" • {}", age), Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(horizontal_divider(inner.width));
+    lines.push(Line::from(Span::styled(
+        "Current activity",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(current_activity_line(selected)));
+    lines.push(horizontal_divider(inner.width));
+
+    if is_wide {
+        let total_width = inner.width as usize;
+        let model_col = total_width / 2;
+        let effort_col = total_width.saturating_sub(model_col);
+        let heading = format!(
+            "{:<model_width$}{:<effort_width$}",
+            "Model",
+            "Effort",
+            model_width = model_col,
+            effort_width = effort_col.max(1),
+        );
+        lines.push(Line::from(Span::styled(
+            heading,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            "{:<width$}{:<width2$}",
+            model,
+            format!("{}", effort),
+            width = model_col,
+            width2 = effort_col.max(1),
+        )));
+    } else {
+        lines.push(horizontal_divider(inner.width));
+        lines.push(Line::from(Span::styled(
+            "Model",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!("  {}", model)));
+        lines.push(Line::from(Span::styled(
+            "Effort",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!("  {}", effort)));
+    }
+
+    lines.push(horizontal_divider(inner.width));
+    lines.push(Line::from(Span::styled(
+        "Recent activity (UTC)",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let limit = if show_activity { HISTORY_LIMIT } else { 3 };
+    let activity_rows = latest_recent_activity(&selected.recent_activity, limit);
+    if activity_rows.is_empty() {
+        lines.push(Line::from("No recent activity"));
+    } else {
+        for entry in activity_rows {
+            let ts = entry
+                .timestamp
+                .as_ref()
+                .map(format_timestamp_short)
+                .unwrap_or_else(|| "-".to_string());
+            lines.push(Line::from(format!(
+                "{:<7}  {:<12} {:<14} {}",
+                ts,
+                entry.kind.replace('_', " "),
+                entry.tool_name.as_deref().unwrap_or("-").replace('_', " "),
+                entry.status.as_deref().unwrap_or("-").replace('_', " "),
+            )));
+        }
+    }
+    lines.push(Line::from(format!(
+        "Press Enter to {} recent activity",
+        if show_activity {
+            "show less"
+        } else {
+            "show more"
+        }
+    )));
+
+    if show_technical {
+        lines.push(Line::from(" "));
+        lines.push(Line::from(Span::styled(
+            "Technical details",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!("Full UUID: {}", selected.thread_id)));
+        lines.push(Line::from(format!("Detected origin: {}", origin)));
+        if !cwd_path.is_empty() {
+            lines.push(Line::from(format!("Full path: {}", cwd_path)));
+        }
+        if let Some(state_detail) = &selected.state_detail {
+            if !state_detail.is_empty() {
+                lines.push(Line::from(format!("Detail: {}", state_detail)));
+            }
+        }
+        if let Some(rollout_path) = &selected.rollout_path {
+            lines.push(Line::from(format!("Rollout path: {}", rollout_path)));
+        }
+        lines.push(Line::from("Press i to collapse"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Technical details",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from("Press i to expand"));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn horizontal_divider(width: u16) -> Line<'static> {
+    let safe_width = width.saturating_sub(1) as usize;
+    if safe_width == 0 {
+        return Line::from("");
+    }
+    Line::from("─".repeat(safe_width))
+}
+
+fn human_state_label(state_label: &str) -> &'static str {
+    match state_label {
+        "DONE" => "Done",
+        "RUNNING" => "Running",
+        "IDLE" => "Idle",
+        "FAILED" => "Failed",
+        "INTERRUPTED" => "Interrupted",
+        "UNKNOWN" => "Unknown",
+        _ => "Unknown",
+    }
+}
+
+fn current_activity_line(thread: &ThreadSnapshot) -> String {
+    if let Some(activity) = thread.recent_activity.last() {
+        let kind = activity.kind.replace('_', " ");
+        let tool = activity
+            .tool_name
+            .clone()
+            .unwrap_or_else(|| "-".to_string())
+            .replace('_', " ");
+        let status = activity
+            .status
+            .clone()
+            .unwrap_or_else(|| "-".to_string())
+            .replace('_', " ");
+        format!("{} {} {}", kind, tool, status)
+    } else {
+        thread
+            .state_detail
+            .clone()
+            .map(|detail| format!("detail: {}", detail.replace('_', " ")))
+            .unwrap_or_else(|| "-".to_string())
+    }
+}
+
+fn latest_recent_activity(
+    activities: &[crate::model::ThreadActivity],
+    limit: usize,
+) -> Vec<&crate::model::ThreadActivity> {
+    activities.iter().rev().take(limit).collect()
+}
+
+fn format_timestamp_short(ts: &DateTime<Utc>) -> String {
+    ts.format("%H:%M").to_string()
+}
+
+fn last_update_for_thread(thread: &ThreadSnapshot) -> Option<DateTime<Utc>> {
+    thread
+        .recency_at
+        .or(thread.updated_at)
+        .or(thread.created_at)
+}
+
+fn state_style(state: ThreadState, bucket: StateBucket) -> Style {
+    match (state, bucket) {
+        (ThreadState::Running, _) => Style::default().fg(Color::Green),
+        (ThreadState::Idle, StateBucket::Done) => Style::default().fg(Color::DarkGray),
+        (ThreadState::Idle, _) => Style::default().fg(Color::Rgb(255, 172, 51)),
+        (ThreadState::Interrupted, _) => Style::default().fg(Color::Red),
+        (ThreadState::Failed, _) => Style::default().fg(Color::Red),
+        (_, StateBucket::Done) => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn bucket_for_state(state: ThreadState, state_detail: Option<&str>) -> StateBucket {
+    let completed = matches!(
+        state_detail,
+        Some(value) if value.eq_ignore_ascii_case("turn_completed")
+    );
+    match state {
+        ThreadState::Running => StateBucket::Running,
+        ThreadState::Idle if completed => StateBucket::Done,
+        ThreadState::Idle => StateBucket::Idle,
+        ThreadState::Failed => StateBucket::Failed,
+        ThreadState::Interrupted => StateBucket::Other,
+        ThreadState::Done => StateBucket::Other,
+        ThreadState::Unknown => StateBucket::Other,
+    }
+}
+
+fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> ListRow {
+    let (model, effort) = preferred_model_and_effort(thread);
+    let (origin_label, _) = origin_label(thread.cwd.as_deref());
+    let short_id = short_id(&thread.thread_id);
+    let age_label = format_time_delta(last_update_for_thread(thread), now);
+    let bucket = bucket_for_state(thread.state.clone(), thread.state_detail.as_deref());
+    let state_label = state_label(thread.state.clone(), thread.state_detail.as_deref());
+    ListRow {
+        thread_id: thread.thread_id.clone(),
+        state: thread.state.clone(),
+        depth,
+        display_name: display_name(thread),
+        short_id,
+        model,
+        effort,
+        origin_label,
+        state_label,
+        state_bucket: bucket,
+        age_label,
+        role: thread.role.clone().unwrap_or_else(|| "-".to_string()),
+        nickname: thread.nickname.clone().unwrap_or_else(|| "-".to_string()),
+        cwd: thread.cwd.clone().unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn count_buckets(rows: &[ListRow]) -> StateCounts {
+    let mut counts = StateCounts::default();
+    for row in rows {
+        match row.state_bucket {
+            StateBucket::Running => counts.running += 1,
+            StateBucket::Idle => counts.idle += 1,
+            StateBucket::Done => counts.done += 1,
+            StateBucket::Failed => counts.failed += 1,
+            StateBucket::Other => {}
+        }
+    }
+    counts
+}
+
+fn matches_filter_query(row: &ListRow, query: &str) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {} {} {} {} {} {}",
+        row.display_name,
+        row.short_id,
+        row.thread_id,
+        row.role,
+        row.nickname,
+        row.cwd,
+        row.model,
+        row.effort
+    )
+    .to_ascii_lowercase();
+    haystack.contains(&q)
+}
+
+fn tree_indent(depth: usize) -> String {
+    if depth == 0 {
+        "  ".to_string()
+    } else {
+        let mut prefix = "  ".repeat(depth);
+        prefix.push_str("└─ ");
+        prefix
+    }
+}
+
+fn short_id(id: &str) -> String {
+    let id = id.trim();
+    if id.chars().count() <= SHORT_ID_LEN {
+        id.to_string()
+    } else {
+        id.chars()
+            .rev()
+            .take(SHORT_ID_LEN)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
+fn format_time_delta(ts: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    match ts {
+        None => "-".to_string(),
+        Some(ts) => {
+            let mut delta = now - ts;
+            if delta < Duration::zero() {
+                delta = Duration::zero();
+            }
+            if delta < Duration::seconds(1) {
+                return "just now".to_string();
+            }
+            let secs = delta.num_seconds();
+            if secs < 60 {
+                format!("{secs}s")
+            } else if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else if secs < 86_400 {
+                format!("{}h", secs / 3600)
+            } else if secs < 604_800 {
+                format!("{}d", secs / 86_400)
+            } else {
+                format!("{}w", secs / 604_800)
+            }
+        }
+    }
+}
+
+fn state_label(state: ThreadState, state_detail: Option<&str>) -> String {
+    if matches!(state, ThreadState::Idle) && state_detail == Some("turn_completed") {
+        "DONE"
+    } else {
+        match state {
+            ThreadState::Running => "RUNNING",
+            ThreadState::Idle => "IDLE",
+            ThreadState::Interrupted => "INTERRUPTED",
+            ThreadState::Failed => "FAILED",
+            ThreadState::Done => "DONE",
+            ThreadState::Unknown => "UNKNOWN",
+        }
+    }
+    .to_string()
+}
+
+fn preferred_model_and_effort(snapshot: &ThreadSnapshot) -> (String, String) {
+    let effective = snapshot.model.effective.value.as_ref();
+    let requested = snapshot.model.requested.value.as_ref();
+    let configured = snapshot.model.configured.value.as_ref();
+    effective
+        .or(requested)
+        .or(configured)
+        .map(|spec| {
+            (
+                spec.model.clone().unwrap_or_else(|| "-".to_string()),
+                spec.reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            )
+        })
+        .unwrap_or_else(|| ("-".to_string(), "-".to_string()))
+}
+
+fn display_name(snapshot: &ThreadSnapshot) -> String {
+    if snapshot
+        .nickname
+        .as_deref()
+        .is_some_and(|nickname| !nickname.trim().is_empty())
+    {
+        return snapshot.nickname.clone().unwrap_or_default();
+    }
+    if snapshot
+        .role
+        .as_deref()
+        .is_some_and(|role| !role.trim().is_empty())
+    {
+        return snapshot.role.clone().unwrap_or_default();
+    }
+    if snapshot.parent_thread_id.is_some() {
+        format!("Worker {}", short_id(&snapshot.thread_id))
+    } else {
+        format!("Main task {}", short_id(&snapshot.thread_id))
+    }
+}
+
+fn origin_label(cwd: Option<&str>) -> (String, String) {
+    let Some(cwd) = cwd.and_then(normalize_path_for_display) else {
+        return ("From: unknown".to_string(), "unknown".to_string());
+    };
+    let path = Path::new(&cwd);
+    for ancestor in path.ancestors() {
+        let git_file = ancestor.join(".git");
+        if git_file.is_dir() || git_file.is_file() {
+            let repo_name = ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("-");
+            return (format!("Project: {}", repo_name), cwd.to_string());
+        }
+    }
+    (format!("From: {cwd}"), cwd.to_string())
+}
+
+fn normalize_path_for_display(cwd: &str) -> Option<String> {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let trimmed = trimmed
+        .strip_prefix(r"\\?\")
+        .or_else(|| trimmed.strip_prefix(r"//?/"))
+        .unwrap_or(trimmed);
+    Some(trimmed.to_string())
 }
 
 fn collect_tree_nodes(
@@ -158,169 +1142,12 @@ fn collect_tree_nodes(
     }
 }
 
-fn model_label(model: &Option<crate::model::ModelSpec>) -> String {
-    match model {
-        Some(model) => format!(
-            "{} / {}",
-            model.model.clone().unwrap_or_else(|| "-".to_string()),
-            model
-                .reasoning_effort
-                .clone()
-                .unwrap_or_else(|| "-".to_string())
-        ),
-        None => "-".to_string(),
-    }
-}
-
-fn source_label(source: &Option<crate::model::EvidenceSource>) -> String {
-    source
-        .as_ref()
-        .map(|s| s.kind.clone())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn render_details(
-    selected: Option<&crate::model::ThreadSnapshot>,
-    show_all: bool,
-) -> Paragraph<'static> {
-    if let Some(selected) = selected {
-        let configured = model_label(&selected.model.configured.value);
-        let requested = model_label(&selected.model.requested.value);
-        let effective = model_label(&selected.model.effective.value);
-        let req = selected
-            .model
-            .requested
-            .value
-            .as_ref()
-            .and_then(|v| v.reasoning_effort.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        let _ = show_all;
-
-        let mut rows = vec![
-            Line::from(Span::styled(
-                format!("Thread: {}", selected.thread_id),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!("State: {:?}", selected.state)),
-            Line::from(
-                selected
-                    .state_detail
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-            ),
-            Line::from(format!(
-                "Nickname: {} (source: {})",
-                selected.nickname.clone().unwrap_or_else(|| "-".to_string()),
-                selected
-                    .evidence
-                    .nickname
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Line::from(format!(
-                "Role: {} (source: {})",
-                selected.role.clone().unwrap_or_else(|| "-".to_string()),
-                selected
-                    .evidence
-                    .role
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Line::from(format!(
-                "Parent: {} (source: {})",
-                selected
-                    .parent_thread_id
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-                selected
-                    .evidence
-                    .parent_thread_id
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Line::from(format!(
-                "CWD: {} (source: {})",
-                selected.cwd.clone().unwrap_or_else(|| "-".to_string()),
-                selected
-                    .evidence
-                    .cwd
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Line::from(format!(
-                "Source kind: {} (source: {})",
-                selected
-                    .source_kind
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-                selected
-                    .evidence
-                    .source_kind
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Line::from(format!(
-                "Configured model: {} (source: {})",
-                configured,
-                source_label(&selected.model.configured.source)
-            )),
-            Line::from(format!(
-                "Requested model: {} (source: {})",
-                requested,
-                source_label(&selected.model.requested.source)
-            )),
-            Line::from(format!(
-                "Effective model: {} (source: {})",
-                effective,
-                source_label(&selected.model.effective.source)
-            )),
-            Line::from(format!(
-                "State detail: {} (source: {})",
-                selected
-                    .state_detail
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-                selected
-                    .evidence
-                    .state
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Line::from(format!("Requested model effort: {}", req)),
-        ];
-        if show_all {
-            rows.push(Line::from(Span::styled(
-                "Recent activity",
-                Style::default().add_modifier(Modifier::UNDERLINED),
-            )));
-            for a in selected.recent_activity.iter().take(10) {
-                rows.push(Line::from(format!(
-                    "{} {} {}",
-                    a.kind,
-                    a.tool_name.clone().unwrap_or_else(|| "-".to_string()),
-                    a.status.clone().unwrap_or_default()
-                )));
-            }
-            if let Some(path) = &selected.rollout_path {
-                rows.push(Line::from(format!("Rollout: {path}")));
-            }
-        }
-        return Paragraph::new(rows).block(Block::default().borders(Borders::ALL).title("Details"));
-    }
-    Paragraph::new("No thread selected")
-        .block(Block::default().borders(Borders::ALL).title("Details"))
+#[derive(Default)]
+struct StateCounts {
+    running: usize,
+    idle: usize,
+    done: usize,
+    failed: usize,
 }
 
 struct TerminalGuard {
@@ -336,6 +1163,8 @@ impl TerminalGuard {
             EnterAlternateScreen,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
         )?;
+        // Flush to avoid stale frame after entering alternate screen on some terminals.
+        stdout.flush()?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = ratatui::Terminal::new(backend)?;
         terminal.hide_cursor()?;
@@ -355,19 +1184,919 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(Debug)]
-struct TuiState {
-    selected: usize,
-    refresh_interval_ms: u64,
-    show_details: bool,
-}
+#[cfg(test)]
+mod tests {
+    use crate::model::ModelSpec;
+    use chrono::Duration;
+    use chrono::Utc;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::fs;
+    use tempfile::TempDir;
 
-impl TuiState {
-    fn new() -> Self {
-        Self {
-            selected: 0,
-            refresh_interval_ms: 1_000,
-            show_details: true,
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_snapshot(
+        thread_id: &str,
+        nickname: Option<&str>,
+        role: Option<&str>,
+        parent_thread_id: Option<&str>,
+        state: ThreadState,
+        state_detail: Option<&str>,
+        cwd: Option<&str>,
+        effective: Option<(&str, &str)>,
+        requested: Option<(&str, &str)>,
+        configured: Option<(&str, &str)>,
+    ) -> ThreadSnapshot {
+        ThreadSnapshot {
+            thread_id: thread_id.to_string(),
+            nickname: nickname.map(std::string::ToString::to_string),
+            role: role.map(std::string::ToString::to_string),
+            parent_thread_id: parent_thread_id.map(std::string::ToString::to_string),
+            cwd: cwd.map(std::string::ToString::to_string),
+            source_kind: None,
+            children: Vec::new(),
+            project: None,
+            state: state.clone(),
+            state_detail: state_detail.map(std::string::ToString::to_string),
+            model: crate::model::ModelSummary {
+                configured: crate::model::Observed {
+                    value: configured.map(|(m, e)| ModelSpec {
+                        model: Some(m.to_string()),
+                        reasoning_effort: Some(e.to_string()),
+                    }),
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                requested: crate::model::Observed {
+                    value: requested.map(|(m, e)| ModelSpec {
+                        model: Some(m.to_string()),
+                        reasoning_effort: Some(e.to_string()),
+                    }),
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                effective: crate::model::Observed {
+                    value: effective.map(|(m, e)| ModelSpec {
+                        model: Some(m.to_string()),
+                        reasoning_effort: Some(e.to_string()),
+                    }),
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                rerouted_from: None,
+                reroute_reason: None,
+            },
+            created_at: None,
+            updated_at: None,
+            recency_at: None,
+            rollout_path: None,
+            warnings: Vec::new(),
+            recent_activity: Vec::new(),
+            evidence: crate::model::ThreadEvidence {
+                nickname: crate::model::Observed {
+                    value: nickname.map(std::string::ToString::to_string),
+                    source: Some(crate::model::EvidenceSource {
+                        kind: "evidence".to_string(),
+                        detail: None,
+                    }),
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                role: crate::model::Observed {
+                    value: role.map(std::string::ToString::to_string),
+                    source: Some(crate::model::EvidenceSource {
+                        kind: "evidence".to_string(),
+                        detail: None,
+                    }),
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                parent_thread_id: crate::model::Observed {
+                    value: parent_thread_id.map(std::string::ToString::to_string),
+                    source: Some(crate::model::EvidenceSource {
+                        kind: "evidence".to_string(),
+                        detail: None,
+                    }),
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                state: crate::model::Observed {
+                    value: Some(state.clone()),
+                    source: Some(crate::model::EvidenceSource {
+                        kind: "evidence".to_string(),
+                        detail: None,
+                    }),
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                cwd: crate::model::Observed {
+                    value: cwd.map(std::string::ToString::to_string),
+                    source: Some(crate::model::EvidenceSource {
+                        kind: "evidence".to_string(),
+                        detail: None,
+                    }),
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                source_kind: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                latest_activity: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+            },
         }
+    }
+
+    #[test]
+    fn fallback_display_name_prefers_nickname_then_role_then_id_fallbacks() {
+        let root = make_snapshot(
+            "root-thread",
+            Some("alpha"),
+            Some("planner"),
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(display_name(&root), "alpha");
+
+        let role = make_snapshot(
+            "role-thread",
+            None,
+            Some("builder"),
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(display_name(&role), "builder");
+
+        let child = make_snapshot(
+            "child-thread",
+            None,
+            None,
+            Some("root-thread"),
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let child_name = display_name(&child);
+        assert!(child_name.starts_with("Worker "));
+        assert!(child_name.ends_with(&short_id(&child.thread_id)));
+
+        let root_fallback = make_snapshot(
+            "main-thread",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let root_name = display_name(&root_fallback);
+        assert!(root_name.starts_with("Main task "));
+        assert!(root_name.ends_with(&short_id(&root_fallback.thread_id)));
+    }
+
+    #[test]
+    fn short_id_uses_last_8_characters() {
+        assert_eq!(short_id("1234567890abcdef"), "90abcdef");
+        assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn age_prefers_recency_over_updated_over_created() {
+        let created = Utc::now() - Duration::seconds(300);
+        let updated = created + Duration::seconds(200);
+        let recency = created + Duration::seconds(280);
+        let mut thread = make_snapshot(
+            "age",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        thread.created_at = Some(created);
+        thread.updated_at = Some(updated);
+        thread.recency_at = Some(recency);
+        let ts = last_update_for_thread(&thread).expect("recency exists");
+        assert_eq!(ts, recency);
+    }
+
+    #[test]
+    fn latest_activity_is_newest_first() {
+        let base_time = Utc::now();
+        let thread = ThreadSnapshot {
+            thread_id: "t".to_string(),
+            nickname: None,
+            role: None,
+            parent_thread_id: None,
+            cwd: None,
+            source_kind: None,
+            children: Vec::new(),
+            project: None,
+            state: ThreadState::Running,
+            state_detail: Some("running".to_string()),
+            model: crate::model::ModelSummary {
+                configured: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                requested: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                effective: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                rerouted_from: None,
+                reroute_reason: None,
+            },
+            created_at: None,
+            updated_at: None,
+            recency_at: None,
+            rollout_path: None,
+            warnings: Vec::new(),
+            recent_activity: vec![
+                crate::model::ThreadActivity {
+                    kind: "old".to_string(),
+                    tool_name: Some("tool".to_string()),
+                    status: Some("start".to_string()),
+                    timestamp: Some(base_time - Duration::minutes(2)),
+                },
+                crate::model::ThreadActivity {
+                    kind: "new".to_string(),
+                    tool_name: Some("tool".to_string()),
+                    status: Some("stop".to_string()),
+                    timestamp: Some(base_time),
+                },
+            ],
+            evidence: crate::model::ThreadEvidence {
+                nickname: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                role: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                parent_thread_id: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                state: crate::model::Observed {
+                    value: Some(ThreadState::Running),
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                cwd: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                source_kind: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+                latest_activity: crate::model::Observed {
+                    value: None,
+                    source: None,
+                    observed_at: None,
+                    confidence: crate::model::Confidence::Low,
+                    detail: None,
+                },
+            },
+        };
+        let latest = latest_recent_activity(&thread.recent_activity, 10);
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[0].kind, "new");
+        assert_eq!(latest[1].kind, "old");
+    }
+
+    #[test]
+    fn render_tui_wide_layout_shows_compact_cards_and_no_duplicate_short_id() {
+        let thread = make_snapshot(
+            "thread-id-11111111112222333344445555",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            Some("C:\\Users\\Work\\Projects\\Example"),
+            Some(("m", "high")),
+            None,
+            None,
+        );
+        let row = build_list_row(&thread, 0, Utc::now());
+        let mut thread_with_activity = thread.clone();
+        thread_with_activity.recent_activity = vec![
+            crate::model::ThreadActivity {
+                kind: "tool_call".to_string(),
+                tool_name: Some("read".to_string()),
+                status: Some("start".to_string()),
+                timestamp: Some(Utc::now()),
+            },
+            crate::model::ThreadActivity {
+                kind: "tool_call".to_string(),
+                tool_name: Some("read".to_string()),
+                status: Some("done".to_string()),
+                timestamp: Some(Utc::now()),
+            },
+            crate::model::ThreadActivity {
+                kind: "tool_call".to_string(),
+                tool_name: Some("write".to_string()),
+                status: Some("start".to_string()),
+                timestamp: Some(Utc::now()),
+            },
+        ];
+        let display = display_name(&thread_with_activity);
+        let short_id = short_id(&thread_with_activity.thread_id);
+        let backend = TestBackend::new(160, 48);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let rows = vec![row.clone()];
+                render_tui_view(
+                    frame,
+                    frame.area(),
+                    &TuiViewState {
+                        visible_rows: &rows,
+                        selected_snapshot: Some(&thread_with_activity),
+                        counts: &StateCounts {
+                            running: 1,
+                            idle: 0,
+                            done: 0,
+                            failed: 0,
+                        },
+                        selected: 0,
+                        state_filter: &LocalStateFilter::All,
+                        last_refresh_label: "just now",
+                        show_activity: false,
+                        show_technical: false,
+                        show_help: false,
+                        search_mode: false,
+                        search_query: "",
+                    },
+                );
+            })
+            .unwrap();
+
+        let terminal_size = terminal.size().unwrap();
+        let terminal_area = Rect::new(0, 0, terminal_size.width, terminal_size.height);
+        let buffer = terminal.backend().buffer().content();
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(3),
+            ])
+            .split(terminal_area);
+
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(outer[1]);
+        let left_area = body[0];
+
+        let mut left_rendered = String::new();
+        let mut left_lines: Vec<String> = Vec::new();
+        for y in left_area.y..(left_area.y + left_area.height) {
+            let mut row_text = String::new();
+            for x in left_area.x..(left_area.x + left_area.width) {
+                let idx = (y as usize) * (terminal_size.width as usize) + (x as usize);
+                if let Some(cell) = buffer.get(idx) {
+                    let symbol = cell.symbol().to_string();
+                    left_rendered.push_str(&symbol);
+                    row_text.push_str(&symbol);
+                }
+            }
+            left_lines.push(row_text);
+        }
+
+        let mut full_rendered = String::new();
+        for cell in buffer.iter() {
+            full_rendered.push_str(cell.symbol());
+        }
+
+        let mut right_rendered = String::new();
+        for y in body[1].y..(body[1].y + body[1].height) {
+            for x in body[1].x..(body[1].x + body[1].width) {
+                let idx = (y as usize) * (terminal_size.width as usize) + (x as usize);
+                if let Some(cell) = buffer.get(idx) {
+                    right_rendered.push_str(cell.symbol());
+                }
+            }
+            right_rendered.push('\n');
+        }
+
+        assert_eq!(display, format!("Main task {}", short_id));
+        assert!(left_rendered.contains(&display));
+        assert_eq!(left_rendered.matches(short_id.as_str()).count(), 1);
+        assert!(!full_rendered.contains(thread.thread_id.as_str()));
+        assert!(right_rendered.contains("Model"));
+        assert!(right_rendered.contains("Effort"));
+        assert!(right_rendered.contains("Current activity"));
+        assert!(right_rendered.contains("Technical details"));
+        assert!(right_rendered.contains("Press i to expand"));
+        assert!(right_rendered.contains("Running"));
+        assert!(right_rendered.contains("─"));
+        assert!(left_rendered.contains("Project:") || left_rendered.contains("From:"));
+        assert!(!right_rendered.contains("No recent activity"));
+        assert!(right_rendered.contains("Recent activity (UTC)"));
+        assert!(right_rendered.contains("tool call"));
+        assert!(full_rendered.contains("RUNNING"));
+        assert!(full_rendered.contains("IDLE"));
+        assert!(full_rendered.contains("DONE"));
+        assert!(full_rendered.contains("FAILED"));
+
+        let right_lines: Vec<&str> = right_rendered.lines().collect();
+        let model = &row.model;
+        let effort = &row.effort;
+        let current_idx = right_lines
+            .iter()
+            .position(|line| line.contains("Current activity"))
+            .expect("current activity heading present");
+        let model_idx = right_lines
+            .iter()
+            .position(|line| line.contains("Model") && line.contains("Effort"))
+            .expect("wide model/effort headings present");
+        assert!(current_idx + 2 < right_lines.len());
+        assert!(model_idx > current_idx + 1);
+        assert!(right_lines[current_idx + 2].contains("─"));
+
+        let model_line = right_lines[model_idx];
+        let values_line = right_lines
+            .get(model_idx + 1)
+            .expect("model effort value line present");
+        assert_eq!(model_line.find("Model"), values_line.find(model));
+        assert_eq!(model_line.find("Effort"), values_line.find(effort));
+
+        let card_title_line = left_lines
+            .iter()
+            .find(|line| line.contains(&display))
+            .expect("selected card title line present");
+        assert!(card_title_line.contains(&format!("   ● {}", display)));
+
+        let buffer = terminal.backend().buffer();
+        let has_cyan_border = buffer.content().iter().enumerate().any(|(idx, cell)| {
+            let y = idx / (terminal_size.width as usize);
+            let x = idx % (terminal_size.width as usize);
+            if x < left_area.x as usize
+                || x >= (left_area.x + left_area.width) as usize
+                || y < left_area.y as usize
+                || y >= (left_area.y + left_area.height) as usize
+            {
+                return false;
+            }
+            matches!(
+                cell.symbol(),
+                "┌" | "╭"
+                    | "╔"
+                    | "┐"
+                    | "╮"
+                    | "╕"
+                    | "┘"
+                    | "╯"
+                    | "╛"
+                    | "└"
+                    | "╰"
+                    | "╚"
+                    | "─"
+            ) && matches!(cell.style().fg, Some(Color::Cyan))
+        });
+        assert!(has_cyan_border, "selected card should render cyan border");
+        let has_cyan_bold_technical = buffer.content().iter().any(|cell| {
+            cell.symbol() == "T"
+                && matches!(cell.style().fg, Some(Color::Cyan))
+                && cell.style().add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(
+            has_cyan_bold_technical,
+            "collapsed technical heading should be cyan and bold"
+        );
+    }
+
+    #[test]
+    fn render_tui_narrow_layout_stays_readable_and_shows_quit_command() {
+        let thread = make_snapshot(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            None,
+            Some("Planner"),
+            None,
+            ThreadState::Running,
+            Some("running"),
+            Some("C:\\Users\\Work\\Projects\\VeryLongProjectName\\Nested\\Path"),
+            Some(("model", "high")),
+            None,
+            None,
+        );
+        let row = build_list_row(&thread, 0, Utc::now());
+        let backend = TestBackend::new(70, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let rows = vec![row.clone()];
+                render_tui_view(
+                    frame,
+                    frame.area(),
+                    &TuiViewState {
+                        visible_rows: &rows,
+                        selected_snapshot: Some(&thread),
+                        counts: &StateCounts {
+                            running: 1,
+                            idle: 0,
+                            done: 0,
+                            failed: 0,
+                        },
+                        selected: 0,
+                        state_filter: &LocalStateFilter::All,
+                        last_refresh_label: "just now",
+                        show_activity: false,
+                        show_technical: false,
+                        show_help: false,
+                        search_mode: false,
+                        search_query: "",
+                    },
+                );
+            })
+            .unwrap();
+
+        let lines = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .collect::<Vec<_>>();
+        let rendered: String = lines.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("q Quit"));
+    }
+
+    #[test]
+    fn render_tui_very_narrow_layout_keeps_footer_command_visible() {
+        let thread = make_snapshot(
+            "cccccccccccccccccccccccccccccccc",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            Some("C:\\Users\\Work\\Projects\\VeryLongProjectName\\Nested\\Path"),
+            Some(("model", "high")),
+            None,
+            None,
+        );
+        let row = build_list_row(&thread, 0, Utc::now());
+        let backend = TestBackend::new(16, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let rows = vec![row.clone()];
+                render_tui_view(
+                    frame,
+                    frame.area(),
+                    &TuiViewState {
+                        visible_rows: &rows,
+                        selected_snapshot: Some(&thread),
+                        counts: &StateCounts {
+                            running: 1,
+                            idle: 0,
+                            done: 0,
+                            failed: 0,
+                        },
+                        selected: 0,
+                        state_filter: &LocalStateFilter::All,
+                        last_refresh_label: "just now",
+                        show_activity: false,
+                        show_technical: false,
+                        show_help: false,
+                        search_mode: false,
+                        search_query: "",
+                    },
+                );
+            })
+            .unwrap();
+
+        let footer_width = 16usize;
+        let (title, footer_text) =
+            footer_text_for_width(false, "", LocalStateFilter::All.label(), footer_width);
+        assert!(footer_text.chars().count() <= footer_width);
+        assert!(footer_text.contains("q Quit"), "q Quit should stay visible");
+        assert!(title.is_empty());
+
+        let lines = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .collect::<Vec<_>>();
+        let rendered: String = lines.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("q Quit"));
+    }
+
+    #[test]
+    fn list_scroll_offset_keeps_selected_card_visible_in_small_viewport() {
+        assert_eq!(list_scroll_offset(0, 10, AGENT_CARD_LINES, 4), 0);
+        assert_eq!(list_scroll_offset(1, 10, AGENT_CARD_LINES, 4), 6);
+        assert_eq!(list_scroll_offset(2, 10, AGENT_CARD_LINES, 4), 12);
+        assert_eq!(list_scroll_offset(9, 10, AGENT_CARD_LINES, 4), 54);
+        assert_eq!(list_scroll_offset(3, 10, AGENT_CARD_LINES, 12), 18);
+        assert_eq!(list_scroll_offset(0, 0, AGENT_CARD_LINES, 12), 0);
+        assert_eq!(list_scroll_offset(1, 10, AGENT_CARD_LINES, 80), 0);
+    }
+
+    #[test]
+    fn footer_text_keeps_quit_visible_on_standard_and_narrow_widths() {
+        let filter = LocalStateFilter::All.label();
+        let (title_80, footer_80) = footer_text_for_width(false, "", filter, 76);
+        assert!(title_80.is_empty());
+        assert!(footer_80.chars().count() <= 76);
+        assert!(footer_80.contains("q Quit"));
+        assert!(footer_80.contains("/ Search"));
+        assert!(footer_80.contains("f Filter"));
+
+        let (title_30, footer_30) = footer_text_for_width(false, "", filter, 30);
+        assert!(title_30.is_empty());
+        assert!(footer_30.chars().count() <= 30);
+        assert!(footer_30.contains("q Quit"));
+
+        let (title_16, footer_16) = footer_text_for_width(false, "", filter, 16);
+        assert!(title_16.is_empty());
+        assert!(footer_16.chars().count() <= 16);
+        assert!(footer_16.contains("q Quit"));
+
+        let (_title_10, footer_10) = footer_text_for_width(false, "", filter, 10);
+        assert!(footer_10.chars().count() <= 10);
+        assert!(footer_10.contains("q Quit"));
+        assert_eq!(footer_10, "q Quit");
+    }
+
+    #[test]
+    fn footer_search_text_truncates_query_to_width() {
+        let (_, footer) =
+            footer_text_for_width(true, "a query that is far too long for the footer", "", 32);
+        assert!(footer.ends_with("Enter apply  Esc cancel"));
+        assert!(footer.chars().count() <= 32);
+    }
+
+    #[test]
+    fn interrupted_and_unknown_states_keep_factual_labels() {
+        assert_eq!(
+            state_label(ThreadState::Interrupted, None),
+            "INTERRUPTED".to_string()
+        );
+        assert_eq!(
+            state_label(ThreadState::Unknown, None),
+            "UNKNOWN".to_string()
+        );
+    }
+
+    #[test]
+    fn model_preference_uses_effective_over_requested_over_configured() {
+        let thread = make_snapshot(
+            "t1",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            Some(("effective", "high")),
+            Some(("requested", "medium")),
+            Some(("configured", "low")),
+        );
+        assert_eq!(
+            preferred_model_and_effort(&thread),
+            ("effective".to_string(), "high".to_string())
+        );
+
+        let thread_no_effective = make_snapshot(
+            "t2",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            Some(("requested", "medium")),
+            Some(("configured", "low")),
+        );
+        assert_eq!(
+            preferred_model_and_effort(&thread_no_effective),
+            ("requested".to_string(), "medium".to_string())
+        );
+
+        let thread_only_configured = make_snapshot(
+            "t3",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            Some(("configured", "low")),
+        );
+        assert_eq!(
+            preferred_model_and_effort(&thread_only_configured),
+            ("configured".to_string(), "low".to_string())
+        );
+
+        let empty = make_snapshot(
+            "t4",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            preferred_model_and_effort(&empty),
+            ("-".to_string(), "-".to_string())
+        );
+    }
+
+    #[test]
+    fn done_bucket_uses_idle_and_turn_completed_only() {
+        let done = make_snapshot(
+            "done",
+            None,
+            None,
+            None,
+            ThreadState::Idle,
+            Some("turn_completed"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            bucket_for_state(done.state, done.state_detail.as_deref()),
+            StateBucket::Done
+        ));
+
+        let not_done = make_snapshot(
+            "notdone",
+            None,
+            None,
+            None,
+            ThreadState::Idle,
+            Some("idle"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            bucket_for_state(not_done.state, not_done.state_detail.as_deref()),
+            StateBucket::Idle
+        ));
+    }
+
+    #[test]
+    fn origin_detects_project_root_and_falls_back_to_from_path() -> Result<(), std::io::Error> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().join("repo");
+        let child = repo_root.join("nested").join("dir");
+        fs::create_dir_all(&child)?;
+        fs::create_dir_all(child.parent().unwrap())?;
+        fs::create_dir_all(repo_root.join(".git"))?;
+
+        let (label, full) = origin_label(Some(&child.to_string_lossy()));
+        assert_eq!(label, "Project: repo");
+        assert_eq!(full, child.to_string_lossy().to_string());
+
+        let cwd_only = temp.path().join("other");
+        fs::create_dir_all(&cwd_only)?;
+        let (label2, full2) = origin_label(Some(&cwd_only.to_string_lossy()));
+        assert_eq!(label2, format!("From: {}", cwd_only.to_string_lossy()));
+        assert_eq!(full2, cwd_only.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn origin_normalizes_windows_verbatim_paths() {
+        let verbatim = r"\\?\C:\Users\Work\project";
+        let (label, full) = origin_label(Some(verbatim));
+        assert_eq!(label, "From: C:\\Users\\Work\\project");
+        assert_eq!(full, "C:\\Users\\Work\\project");
+    }
+
+    #[test]
+    fn filters_match_case_insensitive_query_across_fields() {
+        let thread = make_snapshot(
+            "abc12345",
+            Some("Nicky"),
+            Some("Planner"),
+            None,
+            ThreadState::Running,
+            Some("running"),
+            Some("C:\\Users\\Work"),
+            Some(("gpt-4", "high")),
+            None,
+            None,
+        );
+        let row = build_list_row(&thread, 0, Utc::now());
+        assert!(matches_filter_query(&row, "nicky"));
+        assert!(matches_filter_query(&row, "ABC123"));
+        assert!(matches_filter_query(&row, "planner"));
+        assert!(matches_filter_query(&row, "gpt-4"));
+        assert!(matches_filter_query(&row, "c:\\users"));
+        assert!(!matches_filter_query(&row, "does-not-exist"));
+    }
+
+    #[test]
+    fn state_filter_matches_running_idle_done_failed_cycles() {
+        let running = make_snapshot(
+            "r1",
+            Some("r"),
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let row = build_list_row(&running, 0, Utc::now());
+        assert!(matches_filter_query(&row, ""));
+
+        assert_eq!(StateBucket::Running, row.state_bucket);
+        assert!(LocalStateFilter::Running.matches(row.state_bucket));
+        assert!(!LocalStateFilter::Failed.matches(row.state_bucket));
     }
 }

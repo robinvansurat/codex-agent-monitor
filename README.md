@@ -102,11 +102,20 @@ Message text, instructions, tool input/output, summaries, and results are intent
 Controls:
 
 - `j`/`k` or `↑`/`↓` move selection
-- `↩ Enter` toggles thread details
-- `r` refresh immediately
-- `q` quit
+- `f` cycles the local state filter (`All`, `Running`, `Idle/Done`, `Failed`)
+- `/` enters search mode for name / ID / role / nickname / cwd / model / effort
+- `Enter` toggles recent activity expansion
+- `i` toggles technical details
+- `r` or `F5` forces an immediate snapshot refresh
+- `q`, `Esc`, or `Ctrl-C` to quit
+- `?` toggles a help overlay in the right pane
 
-The TUI is observation-only and shows source/confidence labels for model/state/evidence and parent/cwd/source_kind.
+Behavior notes:
+
+- Top summary shows counts for `RUNNING`, `IDLE`, `DONE`, and `FAILED`.
+- `DONE` is derived from `Idle` + `turn_completed`; other `Idle` entries remain `IDLE`.
+- `FAILED` reflects only real failed states (no fabricated failures).
+- Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, and latest safe recent activity entries. Full path and provenance remain in technical details when expanded.
 
 ## Privacy and limits
 
