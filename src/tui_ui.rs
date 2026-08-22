@@ -4,7 +4,7 @@ use std::time::{Duration as StdDuration, Instant};
 use std::{io, io::Write};
 
 use anyhow::{bail, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{
     execute,
@@ -42,17 +42,13 @@ enum StateBucket {
 enum LocalStateFilter {
     All,
     Running,
-    IdleOrDone,
-    Failed,
 }
 
 impl LocalStateFilter {
     fn next(self) -> Self {
         match self {
             Self::All => Self::Running,
-            Self::Running => Self::IdleOrDone,
-            Self::IdleOrDone => Self::Failed,
-            Self::Failed => Self::All,
+            Self::Running => Self::All,
         }
     }
 
@@ -60,8 +56,6 @@ impl LocalStateFilter {
         match self {
             Self::All => "All",
             Self::Running => "Running",
-            Self::IdleOrDone => "Idle/Done",
-            Self::Failed => "Failed",
         }
     }
 
@@ -69,8 +63,6 @@ impl LocalStateFilter {
         match self {
             Self::All => true,
             Self::Running => matches!(bucket, StateBucket::Running),
-            Self::IdleOrDone => matches!(bucket, StateBucket::Idle | StateBucket::Done),
-            Self::Failed => matches!(bucket, StateBucket::Failed),
         }
     }
 }
@@ -115,6 +107,7 @@ struct ListRow {
     state_label: String,
     state_bucket: StateBucket,
     age_label: String,
+    last_update: Option<DateTime<Utc>>,
     role: String,
     nickname: String,
     cwd: String,
@@ -161,14 +154,8 @@ pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
             continue;
         };
 
-        let visible_rows: Vec<ListRow> = all_rows
-            .iter()
-            .filter(|row| {
-                matches_filter_query(row, &state.search_query)
-                    && state.state_filter.matches(row.state_bucket)
-            })
-            .cloned()
-            .collect();
+        let visible_rows =
+            visible_rows_for_filter(&all_rows, &state.search_query, state.state_filter);
 
         if visible_rows.is_empty() {
             state.selected = 0;
@@ -225,9 +212,9 @@ pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
             std::cmp::min(remaining, StdDuration::from_millis(100))
         };
         if event::poll(timeout)? {
-            if let Event::Key(KeyEvent {
+            if let Some(KeyEvent {
                 code, modifiers, ..
-            }) = event::read()?
+            }) = pressed_key_event(event::read()?)
             {
                 if state.search_mode {
                     match code {
@@ -570,7 +557,7 @@ fn render_help() -> Paragraph<'static> {
         Line::from("q / Esc / Ctrl-C: quit"),
         Line::from("j, k, ↑, ↓: move selection"),
         Line::from("/: enter search mode"),
-        Line::from("f: cycle local state filter (All → Running → Idle/Done → Failed → All)"),
+        Line::from("f: toggle local state filter (All ↔ Running; Running is newest first)"),
         Line::from("r or F5: refresh now"),
         Line::from("Enter: toggle recent activity"),
         Line::from("i: toggle technical details"),
@@ -947,6 +934,7 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
         state_label,
         state_bucket: bucket,
         age_label,
+        last_update: last_update_for_thread(thread),
         role: thread.role.clone().unwrap_or_else(|| "-".to_string()),
         nickname: thread.nickname.clone().unwrap_or_else(|| "-".to_string()),
         cwd: thread.cwd.clone().unwrap_or_else(|| "-".to_string()),
@@ -985,6 +973,24 @@ fn matches_filter_query(row: &ListRow, query: &str) -> bool {
     )
     .to_ascii_lowercase();
     haystack.contains(&q)
+}
+
+fn visible_rows_for_filter(
+    all_rows: &[ListRow],
+    query: &str,
+    state_filter: LocalStateFilter,
+) -> Vec<ListRow> {
+    let mut visible_rows: Vec<ListRow> = all_rows
+        .iter()
+        .filter(|row| matches_filter_query(row, query) && state_filter.matches(row.state_bucket))
+        .cloned()
+        .collect();
+    if matches!(state_filter, LocalStateFilter::Running) {
+        // Vec::sort_by is stable, so the existing tree order remains the
+        // deterministic fallback for ties and unknown timestamps.
+        visible_rows.sort_by(|left, right| right.last_update.cmp(&left.last_update));
+    }
+    visible_rows
 }
 
 fn tree_indent(depth: usize) -> String {
@@ -1148,6 +1154,13 @@ struct StateCounts {
     idle: usize,
     done: usize,
     failed: usize,
+}
+
+fn pressed_key_event(event: Event) -> Option<KeyEvent> {
+    match event {
+        Event::Key(key_event) if key_event.kind == KeyEventKind::Press => Some(key_event),
+        _ => None,
+    }
 }
 
 struct TerminalGuard {
@@ -1327,6 +1340,20 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn pressed_key_event_filters_non_press_keyboard_events() {
+        let key_event =
+            |kind| KeyEvent::new_with_kind(KeyCode::Char('x'), KeyModifiers::empty(), kind);
+
+        let pressed = pressed_key_event(Event::Key(key_event(KeyEventKind::Press)));
+        assert!(matches!(pressed, Some(event) if event.code == KeyCode::Char('x')));
+
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert!(pressed_key_event(Event::Key(key_event(kind))).is_none());
+        }
+        assert!(pressed_key_event(Event::Resize(80, 24)).is_none());
     }
 
     #[test]
@@ -2079,7 +2106,7 @@ mod tests {
     }
 
     #[test]
-    fn state_filter_matches_running_idle_done_failed_cycles() {
+    fn state_filter_toggles_between_all_and_running() {
         let running = make_snapshot(
             "r1",
             Some("r"),
@@ -2097,6 +2124,92 @@ mod tests {
 
         assert_eq!(StateBucket::Running, row.state_bucket);
         assert!(LocalStateFilter::Running.matches(row.state_bucket));
-        assert!(!LocalStateFilter::Failed.matches(row.state_bucket));
+        assert_eq!(LocalStateFilter::Running.next(), LocalStateFilter::All);
+        assert_eq!(LocalStateFilter::All.next(), LocalStateFilter::Running);
+    }
+
+    #[test]
+    fn running_filter_orders_newest_known_activity_first() {
+        let now = Utc::now();
+        let mut oldest = make_snapshot(
+            "oldest",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        oldest.created_at = Some(now - Duration::minutes(3));
+
+        let mut updated = make_snapshot(
+            "updated",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        updated.created_at = Some(now - Duration::minutes(5));
+        updated.updated_at = Some(now - Duration::minutes(2));
+
+        let mut newest = make_snapshot(
+            "newest",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        newest.created_at = Some(now - Duration::minutes(10));
+        newest.updated_at = Some(now - Duration::minutes(4));
+        newest.recency_at = Some(now - Duration::minutes(1));
+
+        let unknown = make_snapshot(
+            "unknown",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let rows = vec![
+            build_list_row(&oldest, 0, now),
+            build_list_row(&updated, 0, now),
+            build_list_row(&newest, 0, now),
+            build_list_row(&unknown, 0, now),
+        ];
+        let all = visible_rows_for_filter(&rows, "", LocalStateFilter::All);
+        assert_eq!(
+            all.iter()
+                .map(|row| row.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oldest", "updated", "newest", "unknown"]
+        );
+
+        let running = visible_rows_for_filter(&rows, "", LocalStateFilter::Running);
+        assert_eq!(
+            running
+                .iter()
+                .map(|row| row.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "updated", "oldest", "unknown"]
+        );
     }
 }

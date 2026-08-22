@@ -102,7 +102,7 @@ Message text, instructions, tool input/output, summaries, and results are intent
 Controls:
 
 - `j`/`k` or `↑`/`↓` move selection
-- `f` cycles the local state filter (`All`, `Running`, `Idle/Done`, `Failed`)
+- `f` toggles the local state filter between `All` and `Running`; `Running` is ordered newest-first by latest known activity
 - `/` enters search mode for name / ID / role / nickname / cwd / model / effort
 - `Enter` toggles recent activity expansion
 - `i` toggles technical details
