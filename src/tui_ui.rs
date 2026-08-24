@@ -20,7 +20,7 @@ use ratatui::{
 };
 
 use crate::cli::FilterOpts;
-use crate::model::{ThreadSnapshot, ThreadState, ThreadTreeNode};
+use crate::model::{Observed, ThreadSnapshot, ThreadState, ThreadTreeNode, TokenUsage};
 use crate::observer::Monitor;
 use crate::runtime::RuntimeOverlay;
 
@@ -103,6 +103,7 @@ struct ListRow {
     short_id: String,
     model: String,
     effort: String,
+    token_total: String,
     origin_label: String,
     state_label: String,
     state_bucket: StateBucket,
@@ -623,10 +624,13 @@ fn render_agent_card(frame: &mut Frame, area: Rect, row: &ListRow, is_selected: 
         Span::raw(format!(" • {}", row.age_label)),
     ]));
 
-    lines.push(Line::from(vec![Span::styled(
-        format!("{} • {}", row.model, row.effort),
-        Style::default(),
-    )]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{} • {} • ", row.model, row.effort),
+            Style::default(),
+        ),
+        Span::styled(row.token_total.clone(), Style::default().fg(Color::Yellow)),
+    ]));
 
     lines.push(Line::from(Span::styled(
         row.origin_label.clone(),
@@ -753,6 +757,17 @@ fn render_details_pane(
         )));
         lines.push(Line::from(format!("  {}", effort)));
     }
+
+    lines.push(horizontal_divider(inner.width));
+    lines.push(Line::from(Span::styled(
+        "Token usage",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format_token_usage_details(
+        &selected.token_usage,
+    )));
 
     lines.push(horizontal_divider(inner.width));
     lines.push(Line::from(Span::styled(
@@ -930,6 +945,7 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
         short_id,
         model,
         effort,
+        token_total: token_total_label(&thread.token_usage),
         origin_label,
         state_label,
         state_bucket: bucket,
@@ -938,6 +954,70 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
         role: thread.role.clone().unwrap_or_else(|| "-".to_string()),
         nickname: thread.nickname.clone().unwrap_or_else(|| "-".to_string()),
         cwd: thread.cwd.clone().unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn token_total_label(observed: &Observed<TokenUsage>) -> String {
+    let total = observed
+        .value
+        .as_ref()
+        .and_then(|usage| usage.total_tokens)
+        .map(format_compact_count)
+        .unwrap_or_else(|| "?".to_string());
+    format!("Tokens {total}")
+}
+
+fn format_token_usage_details(observed: &Observed<TokenUsage>) -> String {
+    let Some(usage) = observed.value.as_ref() else {
+        return format!(
+            "total=?  input=?  cached input=?  cache-write input=?  output=?  reasoning output=?  context window=?  (source={})",
+            source_label(observed)
+        );
+    };
+    format!(
+        "total={}  input={}  cached input={}  cache-write input={}  output={}  reasoning output={}  context window={}  (source={})",
+        format_optional_count(usage.total_tokens),
+        format_optional_count(usage.input_tokens),
+        format_optional_count(usage.cached_input_tokens),
+        format_optional_count(usage.cache_write_input_tokens),
+        format_optional_count(usage.output_tokens),
+        format_optional_count(usage.reasoning_output_tokens),
+        format_optional_count(usage.context_window),
+        source_label(observed),
+    )
+}
+
+fn source_label(observed: &Observed<TokenUsage>) -> &str {
+    observed
+        .source
+        .as_ref()
+        .map(|source| source.kind.as_str())
+        .unwrap_or("unknown")
+}
+
+fn format_optional_count(value: Option<u64>) -> String {
+    value.map(format_count).unwrap_or_else(|| "?".to_string())
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn format_compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }
 
@@ -1199,7 +1279,7 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::ModelSpec;
+    use crate::model::{Confidence, EvidenceSource, ModelSpec, TokenUsage};
     use chrono::Duration;
     use chrono::Utc;
     use ratatui::backend::TestBackend;
@@ -1267,6 +1347,7 @@ mod tests {
                 rerouted_from: None,
                 reroute_reason: None,
             },
+            token_usage: crate::model::Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,
@@ -1488,6 +1569,7 @@ mod tests {
                 rerouted_from: None,
                 reroute_reason: None,
             },
+            token_usage: crate::model::Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,
@@ -1579,8 +1661,26 @@ mod tests {
             None,
             None,
         );
-        let row = build_list_row(&thread, 0, Utc::now());
         let mut thread_with_activity = thread.clone();
+        thread_with_activity.token_usage = Observed {
+            value: Some(TokenUsage {
+                input_tokens: Some(1_234),
+                cached_input_tokens: Some(20),
+                cache_write_input_tokens: Some(3),
+                output_tokens: Some(400),
+                reasoning_output_tokens: Some(100),
+                total_tokens: Some(1_757),
+                context_window: Some(128_000),
+            }),
+            source: Some(EvidenceSource {
+                kind: "rollout.token_count".to_string(),
+                detail: None,
+            }),
+            observed_at: None,
+            confidence: Confidence::High,
+            detail: None,
+        };
+        let row = build_list_row(&thread_with_activity, 0, Utc::now());
         thread_with_activity.recent_activity = vec![
             crate::model::ThreadActivity {
                 kind: "tool_call".to_string(),
@@ -1696,8 +1796,12 @@ mod tests {
         assert!(right_rendered.contains("Running"));
         assert!(right_rendered.contains("─"));
         assert!(left_rendered.contains("Project:") || left_rendered.contains("From:"));
+        assert!(left_rendered.contains("Tokens 1.8k"));
         assert!(!right_rendered.contains("No recent activity"));
         assert!(right_rendered.contains("Recent activity (UTC)"));
+        assert!(right_rendered.contains("Token usage"));
+        assert!(right_rendered.contains("total=1,757"));
+        assert!(right_rendered.contains("rollout.token_count"));
         assert!(right_rendered.contains("tool call"));
         assert!(full_rendered.contains("RUNNING"));
         assert!(full_rendered.contains("IDLE"));

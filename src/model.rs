@@ -77,6 +77,17 @@ pub struct ModelSummary {
     pub reroute_reason: Option<Observed<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThreadState {
@@ -153,6 +164,7 @@ pub struct ThreadSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_detail: Option<String>,
     pub model: ModelSummary,
+    pub token_usage: Observed<TokenUsage>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub recency_at: Option<DateTime<Utc>>,

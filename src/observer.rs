@@ -13,7 +13,7 @@ use crate::config::{
 use crate::db::DbThreadRecord;
 use crate::model::{
     Confidence, EvidenceSource, ModelSpec, ModelSummary, Observed, ProbeEnvironment, ProbeOutput,
-    QueryInfo, ThreadActivity, ThreadEvidence, ThreadSnapshot, ThreadState,
+    QueryInfo, ThreadActivity, ThreadEvidence, ThreadSnapshot, ThreadState, TokenUsage,
 };
 use crate::rollout::{RolloutParseResult, RolloutStateHint};
 use crate::runtime::RuntimeOverlay;
@@ -222,6 +222,7 @@ impl Monitor {
                     rerouted_from: runtime.rerouted_from.get(&thread.id).cloned(),
                     reroute_reason: runtime.reroute_reason.get(&thread.id).cloned(),
                 },
+                token_usage: token_usage_observation(rollouts.get(&thread.id)),
                 created_at: thread.created_at,
                 updated_at: thread.updated_at,
                 recency_at: thread.recency_at,
@@ -283,6 +284,30 @@ impl Monitor {
             threads: thread_rows,
             tree,
         })
+    }
+}
+
+fn token_usage_observation(parsed: Option<&RolloutParseResult>) -> Observed<TokenUsage> {
+    let Some(observation) = parsed.and_then(|rollout| rollout.token_usage.as_ref()) else {
+        return Observed::unknown();
+    };
+    Observed {
+        value: Some(TokenUsage {
+            input_tokens: observation.input_tokens,
+            cached_input_tokens: observation.cached_input_tokens,
+            cache_write_input_tokens: observation.cache_write_input_tokens,
+            output_tokens: observation.output_tokens,
+            reasoning_output_tokens: observation.reasoning_output_tokens,
+            total_tokens: observation.total_tokens,
+            context_window: observation.context_window,
+        }),
+        source: Some(EvidenceSource {
+            kind: observation.source.clone(),
+            detail: Some("latest valid cumulative token_count observation".to_string()),
+        }),
+        observed_at: observation.observed_at,
+        confidence: Confidence::High,
+        detail: Some("cumulative task token usage; account credits unavailable".to_string()),
     }
 }
 
@@ -880,6 +905,31 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_observation_preserves_breakdown_and_evidence() {
+        let parsed = RolloutParseResult {
+            token_usage: Some(crate::rollout::RolloutTokenUsageObservation {
+                input_tokens: Some(10),
+                cached_input_tokens: Some(2),
+                cache_write_input_tokens: None,
+                output_tokens: Some(4),
+                reasoning_output_tokens: Some(1),
+                total_tokens: Some(15),
+                context_window: Some(128_000),
+                source: "rollout.token_count".to_string(),
+                observed_at: Some(Utc.timestamp_opt(1_720_000_100, 0).unwrap()),
+            }),
+            ..Default::default()
+        };
+        let observed = token_usage_observation(Some(&parsed));
+        let usage = observed.value.expect("token usage");
+        assert_eq!(usage.total_tokens, Some(15));
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.context_window, Some(128_000));
+        assert_eq!(observed.source.unwrap().kind, "rollout.token_count");
+        assert_eq!(observed.confidence, Confidence::High);
+    }
+
+    #[test]
     fn configured_model_missing_remains_unknown() {
         let cfg = crate::config::ConfigContext {
             global: None,
@@ -965,6 +1015,7 @@ mod tests {
             canonical_agent_path: None,
             canonical_meta_seen: true,
             requested_model: None,
+            token_usage: None,
             canonical_meta_timestamp: None,
             warnings: vec![],
             activity: vec![],
@@ -1036,6 +1087,7 @@ mod tests {
                 rerouted_from: None,
                 reroute_reason: None,
             },
+            token_usage: Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,

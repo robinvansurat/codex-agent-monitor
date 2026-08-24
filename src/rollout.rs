@@ -9,6 +9,7 @@ pub struct RolloutParseResult {
     pub warnings: Vec<String>,
     pub canonical_parent: Option<String>,
     pub requested_model: Option<RolloutModelObservation>,
+    pub token_usage: Option<RolloutTokenUsageObservation>,
     pub canonical_nickname: Option<String>,
     pub canonical_role: Option<String>,
     pub canonical_agent_path: Option<String>,
@@ -17,6 +18,19 @@ pub struct RolloutParseResult {
     pub activity: Vec<RolloutActivity>,
     pub final_state: RolloutStateHint,
     pub tail_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutTokenUsageObservation {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub source: String,
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +181,14 @@ fn process_record(value: &Value, thread_id: &str, result: &mut RolloutParseResul
         }
     }
 
+    if let Some(token_usage) =
+        extract_token_usage_observation(event_type.as_deref(), &payload, record_timestamp)
+    {
+        if !is_older_copy {
+            result.token_usage = Some(token_usage);
+        }
+    }
+
     if !is_older_copy {
         if let Some(activity) = build_activity(event_type.clone(), payload, record_timestamp) {
             result.activity.push(activity);
@@ -206,6 +228,69 @@ fn process_record(value: &Value, thread_id: &str, result: &mut RolloutParseResul
             _ => {}
         }
     }
+}
+
+fn extract_token_usage_observation(
+    event_type: Option<&str>,
+    payload: &Option<&Value>,
+    observed_at: Option<DateTime<Utc>>,
+) -> Option<RolloutTokenUsageObservation> {
+    if event_type != Some("token_count") {
+        return None;
+    }
+    let target = match payload {
+        Some(value) => value.get("payload").unwrap_or(value),
+        None => &Value::Null,
+    };
+    let info = pick_key_paths(target, &[&["info"], &["payload", "info"]])?;
+    let totals = pick_key_paths(
+        info,
+        &[
+            &["total_token_usage"],
+            &["totalTokenUsage"],
+            &["payload", "total_token_usage"],
+            &["payload", "totalTokenUsage"],
+        ],
+    )?;
+    let totals = totals.as_object()?;
+    let field = |name: &str| lookup_ci(totals, name).and_then(parse_token_count);
+    let input_tokens = field("input_tokens");
+    let cached_input_tokens = field("cached_input_tokens");
+    let cache_write_input_tokens = field("cache_write_input_tokens");
+    let output_tokens = field("output_tokens");
+    let reasoning_output_tokens = field("reasoning_output_tokens");
+    let total_tokens = field("total_tokens");
+    let context_window = lookup_ci(info.as_object()?, "model_context_window")
+        .or_else(|| lookup_ci(target.as_object()?, "model_context_window"))
+        .and_then(parse_token_count);
+
+    // A token_count record is useful only when it contributes at least one
+    // valid usage counter. Missing or malformed counters remain unknown.
+    if input_tokens.is_none()
+        && cached_input_tokens.is_none()
+        && cache_write_input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_output_tokens.is_none()
+        && total_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(RolloutTokenUsageObservation {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+        context_window,
+        source: "rollout.token_count".to_string(),
+        observed_at,
+    })
+}
+
+fn parse_token_count(value: &Value) -> Option<u64> {
+    value.as_u64()
 }
 
 fn extract_event_type(value: &Value) -> Option<String> {
@@ -664,6 +749,64 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("malformed JSONL line 2")));
+    }
+
+    #[test]
+    fn parse_rollout_tracks_latest_token_usage_and_context_window() {
+        let path = Path::new("tests/fixtures/rollout/token_usage.jsonl");
+        let result = parse_rollout_file(path, "token-thread", false);
+        assert_eq!(
+            result.token_usage,
+            Some(RolloutTokenUsageObservation {
+                input_tokens: Some(30),
+                cached_input_tokens: Some(5),
+                cache_write_input_tokens: Some(2),
+                output_tokens: Some(8),
+                reasoning_output_tokens: Some(6),
+                total_tokens: Some(51),
+                context_window: Some(128_000),
+                source: "rollout.token_count".into(),
+                observed_at: Some(Utc.timestamp_opt(1_720_010_002, 0).unwrap()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rollout_preserves_partial_usage_and_ignores_malformed_usage() {
+        let path = Path::new("tests/fixtures/rollout/token_usage_partial.jsonl");
+        let result = parse_rollout_file(path, "token-thread", false);
+        let usage = result.token_usage.expect("latest valid usage");
+        assert_eq!(usage.input_tokens, Some(17));
+        assert_eq!(usage.total_tokens, Some(22));
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.context_window, None);
+    }
+
+    #[test]
+    fn parse_rollout_ignores_stale_token_usage_before_canonical_boundary() {
+        let path = Path::new("tests/fixtures/rollout/token_usage_stale_copy.jsonl");
+        let result = parse_rollout_file(path, "token-stale-thread", false);
+        assert_eq!(
+            result
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(12)
+        );
+        assert_eq!(
+            result
+                .token_usage
+                .as_ref()
+                .and_then(|usage| usage.input_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn parse_rollout_ignores_token_count_without_valid_counters() {
+        let path = Path::new("tests/fixtures/rollout/token_usage_malformed.jsonl");
+        let result = parse_rollout_file(path, "missing-thread", false);
+        assert!(result.token_usage.is_none());
     }
 
     #[test]

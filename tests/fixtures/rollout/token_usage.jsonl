@@ -1,0 +1,3 @@
+{"timestamp":1720010000,"type":"session_meta","payload":{"id":"token-thread","nickname":"TokenTask"}}
+{"timestamp":1720010001,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":1,"output_tokens":4,"reasoning_output_tokens":3,"total_tokens":20},"model_context_window":128000}}}
+{"timestamp":1720010002,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"cached_input_tokens":5,"cache_write_input_tokens":2,"output_tokens":8,"reasoning_output_tokens":6,"total_tokens":51},"model_context_window":128000}}}

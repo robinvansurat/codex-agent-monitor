@@ -85,6 +85,17 @@ Each candidate edge is cycle-checked before insertion. Orphans remain roots.
 
 Thread snapshots expose latest 25 entries in ordering logic, with confidence lowered when timestamps are absent.
 
+## Token usage parsing
+
+`event_msg` records with `payload.type=token_count` are parsed for the latest valid
+`info.total_token_usage` observation. The cumulative breakdown is retained as
+evidence-aware `ThreadSnapshot.token_usage`; fields that are missing or malformed
+remain unknown rather than being replaced with zero. `info.model_context_window`
+is retained when present. Records from copied history before the canonical session
+metadata boundary are ignored using the same stale-record guard as other rollout
+facts. Account-level `rate_limits.credits` is not per-task consumption, so no task
+credit or cost estimate is produced.
+
 ## Watch model
 
 Long-running refresh in `watch` is implemented as efficient polling with rollout cache:

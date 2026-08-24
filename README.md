@@ -22,6 +22,7 @@ It is **not**:
 - Build deterministic parent/child thread hierarchy with explicit `thread_spawn_edges` precedence
 - Parse rollout JSONL safely (tolerant of malformed lines, canonical thread identity checks, missing files)
 - Expose evidence-aware snapshots and provenance (`source`, `confidence`, `observed_at`, `detail`)
+- Expose the latest cumulative per-task token usage observation from rollout `token_count` events
 - Optional TUI for navigation and thread details
 - Optional `--runtime-events` overlay (`model/rerouted`) for ephemeral effective model/reroute facts
 
@@ -77,6 +78,7 @@ Global/command options include:
 - `threads` and flattened `tree`
 - `warnings`
 - `recent_activity` per thread (safe event/tool name/status only)
+- `token_usage` per thread: latest cumulative `token_count` breakdown (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, and optional `context_window`) with evidence metadata; missing or malformed counters remain unknown
 
 Model fields are separated:
 
@@ -115,7 +117,7 @@ Behavior notes:
 - Top summary shows counts for `RUNNING`, `IDLE`, `DONE`, and `FAILED`.
 - `DONE` is derived from `Idle` + `turn_completed`; other `Idle` entries remain `IDLE`.
 - `FAILED` reflects only real failed states (no fabricated failures).
-- Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, and latest safe recent activity entries. Full path and provenance remain in technical details when expanded.
+- Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, measured token-usage breakdown, and latest safe recent activity entries. Full path and provenance remain in technical details when expanded.
 
 ## Privacy and limits
 
@@ -128,6 +130,7 @@ Persisted observations are best-effort and partial by design:
 - lock presence in DB indicates writer lock only; not equivalent to active in-memory agent status
 - effective model is not present in persisted rollout or DB output; only supplied runtime stream updates (`model/rerouted`) can expose transient effective model/reroute state
 - runtime `model/rerouted` is transient and not persisted in DB
+- per-task credit consumption is not available from rollout data; `rate_limits.credits` is account-level status, so the monitor does not estimate or display task credits/cost
 - canonical thread-parent inference uses **thread id equality**, not copied historical metadata
 
 ## Verified environment notes
