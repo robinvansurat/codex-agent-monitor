@@ -60,6 +60,25 @@ impl<T> Observed<T> {
     }
 }
 
+impl<T> Default for Observed<T> {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountUsageWindow {
+    pub used_percent: Option<f64>,
+    pub window_minutes: Option<u64>,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AccountUsage {
+    pub primary: Option<AccountUsageWindow>,
+    pub secondary: Option<AccountUsageWindow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub model: Option<String>,
@@ -193,6 +212,8 @@ pub struct ProbeOutput {
     pub environment: ProbeEnvironment,
     pub query: QueryInfo,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub account_usage: Observed<AccountUsage>,
     pub threads: Vec<ThreadSnapshot>,
     pub tree: Vec<ThreadTreeNode>,
 }

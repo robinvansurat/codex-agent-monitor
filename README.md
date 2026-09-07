@@ -23,6 +23,7 @@ It is **not**:
 - Parse rollout JSONL safely (tolerant of malformed lines, canonical thread identity checks, missing files)
 - Expose evidence-aware snapshots and provenance (`source`, `confidence`, `observed_at`, `detail`)
 - Expose the latest cumulative per-task token usage observation from rollout `token_count` events
+- Show the latest account usage allowance observed in monitored rollout `rate_limits` events
 - Optional TUI for navigation and thread details
 - Optional `--runtime-events` overlay (`model/rerouted`) for ephemeral effective model/reroute facts
 
@@ -77,6 +78,7 @@ Global/command options include:
 - `query` (normalized query inputs)
 - `threads` and flattened `tree`
 - `warnings`
+- `account_usage`: latest timestamped rollout allowance snapshot with typed `primary` and `secondary` windows (`used_percent`, positive `window_minutes`, optional `resets_at`), plus evidence metadata
 - `recent_activity` per thread (safe event/tool name/status only)
 - `token_usage` per thread: latest cumulative `token_count` breakdown (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, and optional `context_window`) with evidence metadata; missing or malformed counters remain unknown
 
@@ -118,6 +120,7 @@ Behavior notes:
 - `DONE` is derived from `Idle` + `turn_completed`; other `Idle` entries remain `IDLE`.
 - `FAILED` reflects only real failed states (no fabricated failures).
 - Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, measured token-usage breakdown, and latest safe recent activity entries. Full path and provenance remain in technical details when expanded.
+- The top bar shows `Usage left` from the latest timestamped `rate_limits` observation. Window names come from their observed duration (for example, `Weekly` for 10080 minutes and `5h` for 300 minutes); expired windows stay unavailable until a newer observation arrives.
 
 ## Privacy and limits
 
@@ -131,6 +134,7 @@ Persisted observations are best-effort and partial by design:
 - effective model is not present in persisted rollout or DB output; only supplied runtime stream updates (`model/rerouted`) can expose transient effective model/reroute state
 - runtime `model/rerouted` is transient and not persisted in DB
 - per-task credit consumption is not available from rollout data; `rate_limits.credits` is account-level status, so the monitor does not estimate or display task credits/cost
+- account usage is derived only from already parsed monitored rollouts. CLI project/thread/role/recent filters bound the evidence that can contribute to the snapshot; state/depth and local TUI search/filtering only change the displayed rows after the account snapshot is assembled.
 - canonical thread-parent inference uses **thread id equality**, not copied historical metadata
 
 ## Verified environment notes

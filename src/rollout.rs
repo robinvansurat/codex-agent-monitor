@@ -10,6 +10,7 @@ pub struct RolloutParseResult {
     pub canonical_parent: Option<String>,
     pub requested_model: Option<RolloutModelObservation>,
     pub token_usage: Option<RolloutTokenUsageObservation>,
+    pub account_usage: Option<RolloutAccountUsageObservation>,
     pub canonical_nickname: Option<String>,
     pub canonical_role: Option<String>,
     pub canonical_agent_path: Option<String>,
@@ -18,6 +19,21 @@ pub struct RolloutParseResult {
     pub activity: Vec<RolloutActivity>,
     pub final_state: RolloutStateHint,
     pub tail_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutAccountUsageObservation {
+    pub primary: Option<RolloutAccountUsageWindow>,
+    pub secondary: Option<RolloutAccountUsageWindow>,
+    pub source: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutAccountUsageWindow {
+    pub used_percent: Option<f64>,
+    pub window_minutes: Option<u64>,
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +205,19 @@ fn process_record(value: &Value, thread_id: &str, result: &mut RolloutParseResul
         }
     }
 
+    if let Some(account_usage) =
+        extract_account_usage_observation(event_type.as_deref(), &payload, record_timestamp)
+    {
+        if !is_older_copy
+            && result
+                .account_usage
+                .as_ref()
+                .is_none_or(|existing| account_usage.observed_at >= existing.observed_at)
+        {
+            result.account_usage = Some(account_usage);
+        }
+    }
+
     if !is_older_copy {
         if let Some(activity) = build_activity(event_type.clone(), payload, record_timestamp) {
             result.activity.push(activity);
@@ -286,6 +315,60 @@ fn extract_token_usage_observation(
         context_window,
         source: "rollout.token_count".to_string(),
         observed_at,
+    })
+}
+
+fn extract_account_usage_observation(
+    event_type: Option<&str>,
+    payload: &Option<&Value>,
+    observed_at: Option<DateTime<Utc>>,
+) -> Option<RolloutAccountUsageObservation> {
+    if event_type != Some("token_count") {
+        return None;
+    }
+    let observed_at = observed_at?;
+    let target = match payload {
+        Some(value) => value.get("payload").unwrap_or(value),
+        None => &Value::Null,
+    };
+    let rate_limits = pick_key_paths(target, &[&["rate_limits"], &["payload", "rate_limits"]])?;
+    let object = rate_limits.as_object()?;
+    match lookup_ci(object, "limit_id") {
+        None | Some(Value::Null) => {}
+        Some(value)
+            if value
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case("codex")) => {}
+        Some(_) => return None,
+    }
+
+    let primary = lookup_ci(object, "primary").and_then(parse_account_usage_window);
+    let secondary = lookup_ci(object, "secondary").and_then(parse_account_usage_window);
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+
+    Some(RolloutAccountUsageObservation {
+        primary,
+        secondary,
+        source: "rollout.rate_limits".to_string(),
+        observed_at,
+    })
+}
+
+fn parse_account_usage_window(value: &Value) -> Option<RolloutAccountUsageWindow> {
+    let object = value.as_object()?;
+    let used_percent = lookup_ci(object, "used_percent")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let window_minutes = lookup_ci(object, "window_minutes")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
+    let resets_at = lookup_ci(object, "resets_at").and_then(parse_timestamp_value);
+    Some(RolloutAccountUsageWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
     })
 }
 
@@ -807,6 +890,33 @@ mod tests {
         let path = Path::new("tests/fixtures/rollout/token_usage_malformed.jsonl");
         let result = parse_rollout_file(path, "missing-thread", false);
         assert!(result.token_usage.is_none());
+    }
+
+    #[test]
+    fn parse_rollout_extracts_latest_account_usage_and_ignores_stale_or_other_buckets() {
+        let path = Path::new("tests/fixtures/rollout/rate_limits_usage.jsonl");
+        let result = parse_rollout_file(path, "usage-thread", false);
+        let usage = result.account_usage.expect("account usage");
+        assert_eq!(usage.observed_at, Utc.timestamp_opt(101, 0).unwrap());
+        let primary = usage.primary.expect("primary window");
+        assert_eq!(primary.used_percent, Some(44.0));
+        assert_eq!(primary.window_minutes, Some(10_080));
+        assert_eq!(primary.resets_at, Some(Utc.timestamp_opt(2000, 0).unwrap()));
+        let secondary = usage.secondary.expect("secondary window");
+        assert_eq!(secondary.used_percent, Some(25.0));
+        assert_eq!(secondary.window_minutes, Some(300));
+    }
+
+    #[test]
+    fn parse_rollout_keeps_malformed_account_fields_unknown_and_accepts_null_info() {
+        let path = Path::new("tests/fixtures/rollout/rate_limits_malformed.jsonl");
+        let result = parse_rollout_file(path, "missing-thread", false);
+        let usage = result.account_usage.expect("account usage");
+        let primary = usage.primary.expect("primary window");
+        assert_eq!(primary.used_percent, None);
+        assert_eq!(primary.window_minutes, None);
+        assert_eq!(primary.resets_at, None);
+        assert_eq!(usage.secondary, None);
     }
 
     #[test]

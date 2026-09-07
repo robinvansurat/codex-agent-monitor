@@ -1,0 +1,2 @@
+{"timestamp":200,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":null,"primary":{"used_percent":"bad","window_minutes":0,"resets_at":"bad"},"secondary":null}}}
+{"timestamp":201,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1}},"rate_limits":{"limit_id":"codex_bengalfox","primary":{"used_percent":10,"window_minutes":300}}}}

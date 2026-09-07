@@ -20,7 +20,10 @@ use ratatui::{
 };
 
 use crate::cli::FilterOpts;
-use crate::model::{Observed, ThreadSnapshot, ThreadState, ThreadTreeNode, TokenUsage};
+use crate::model::{
+    AccountUsage, AccountUsageWindow, Observed, ThreadSnapshot, ThreadState, ThreadTreeNode,
+    TokenUsage,
+};
 use crate::observer::Monitor;
 use crate::runtime::RuntimeOverlay;
 
@@ -194,6 +197,7 @@ pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
                     visible_rows: &visible_rows,
                     selected_snapshot,
                     counts: &counts,
+                    account_usage: &active_snapshot.account_usage,
                     selected: state.selected,
                     state_filter: &state.state_filter,
                     last_refresh_label: status_span.as_str(),
@@ -318,6 +322,7 @@ struct TuiViewState<'a> {
     visible_rows: &'a [ListRow],
     selected_snapshot: Option<&'a ThreadSnapshot>,
     counts: &'a StateCounts,
+    account_usage: &'a Observed<AccountUsage>,
     selected: usize,
     state_filter: &'a LocalStateFilter,
     last_refresh_label: &'a str,
@@ -330,7 +335,7 @@ struct TuiViewState<'a> {
 
 fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_>) {
     let is_wide = size.width >= 100;
-    let header_height = if is_wide { 3 } else { 4 };
+    let header_height = if is_wide { 4 } else { 7 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -346,6 +351,7 @@ fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_
         frame,
         outer[0],
         render_state.counts,
+        render_state.account_usage,
         render_state.last_refresh_label,
         is_wide,
     );
@@ -401,6 +407,7 @@ fn render_header(
     frame: &mut Frame,
     area: Rect,
     counts: &StateCounts,
+    account_usage: &Observed<AccountUsage>,
     last_refresh: &str,
     is_wide: bool,
 ) {
@@ -434,6 +441,10 @@ fn render_header(
             format!("Auto-refresh • {}", last_refresh),
             Style::default().fg(Color::DarkGray),
         ));
+        let header_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(inner);
         let row = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -441,22 +452,91 @@ fn render_header(
                 Constraint::Percentage(46),
                 Constraint::Percentage(20),
             ])
-            .split(inner);
+            .split(header_rows[0]);
         frame.render_widget(Paragraph::new(title), row[0]);
         frame.render_widget(Paragraph::new(status_line), row[1]);
         frame.render_widget(Paragraph::new(refresh).alignment(Alignment::Right), row[2]);
+        frame.render_widget(
+            Paragraph::new(account_usage_line(account_usage, Utc::now())),
+            header_rows[1],
+        );
         return;
     }
 
-    let lines = vec![
-        title,
-        status_line,
-        Line::from(format!(
+    let header_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(title), header_rows[0]);
+    frame.render_widget(Paragraph::new(status_line), header_rows[1]);
+    frame.render_widget(
+        Paragraph::new(account_usage_line(account_usage, Utc::now())).wrap(Wrap { trim: false }),
+        header_rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
             "Updated: {}  •  Auto-refresh {}ms",
             last_refresh, REFRESH_INTERVAL_MS
         )),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
+        header_rows[3],
+    );
+}
+
+fn account_usage_line(account_usage: &Observed<AccountUsage>, now: DateTime<Utc>) -> String {
+    let Some(usage) = account_usage.value.as_ref() else {
+        return "Usage left: unavailable".to_string();
+    };
+
+    let mut windows = Vec::new();
+    if let Some(window) = usage.primary.as_ref() {
+        windows.push(account_usage_window_label(window, now));
+    }
+    if let Some(window) = usage.secondary.as_ref() {
+        windows.push(account_usage_window_label(window, now));
+    }
+    if windows.is_empty() {
+        return "Usage left: unavailable".to_string();
+    }
+
+    let observed = account_usage
+        .observed_at
+        .map(|timestamp| format_time_delta(Some(timestamp), now))
+        .unwrap_or_else(|| "unknown age".to_string());
+    format!(
+        "Usage left: {}  •  observed {}",
+        windows.join(" · "),
+        observed
+    )
+}
+
+fn account_usage_window_label(window: &AccountUsageWindow, now: DateTime<Utc>) -> String {
+    let duration = window
+        .window_minutes
+        .map(account_usage_duration_label)
+        .unwrap_or_else(|| "unknown window".to_string());
+    let remaining = if window.resets_at.is_some_and(|reset| reset <= now) {
+        "awaiting update".to_string()
+    } else if let Some(used) = window.used_percent {
+        format!("{:.0}%", (100.0 - used).clamp(0.0, 100.0))
+    } else {
+        "unavailable".to_string()
+    };
+    format!("{duration} {remaining}")
+}
+
+fn account_usage_duration_label(minutes: u64) -> String {
+    match minutes {
+        300 => "5h".to_string(),
+        10_080 => "Weekly".to_string(),
+        minutes if minutes % (24 * 60) == 0 => format!("{}d", minutes / (24 * 60)),
+        minutes if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        minutes => format!("{}m", minutes),
+    }
 }
 
 fn render_footer(
@@ -1279,7 +1359,9 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Confidence, EvidenceSource, ModelSpec, TokenUsage};
+    use crate::model::{
+        AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, ModelSpec, TokenUsage,
+    };
     use chrono::Duration;
     use chrono::Utc;
     use ratatui::backend::TestBackend;
@@ -1720,6 +1802,7 @@ mod tests {
                             done: 0,
                             failed: 0,
                         },
+                        account_usage: &Observed::unknown(),
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
                         last_refresh_label: "just now",
@@ -1741,7 +1824,7 @@ mod tests {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(4),
                 Constraint::Min(1),
                 Constraint::Length(3),
             ])
@@ -1907,6 +1990,7 @@ mod tests {
                             done: 0,
                             failed: 0,
                         },
+                        account_usage: &Observed::unknown(),
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
                         last_refresh_label: "just now",
@@ -1928,6 +2012,138 @@ mod tests {
             .collect::<Vec<_>>();
         let rendered: String = lines.iter().map(|cell| cell.symbol()).collect();
         assert!(rendered.contains("q Quit"));
+    }
+
+    #[test]
+    fn usage_header_keeps_usage_and_counts_visible_at_supported_widths() {
+        let thread = make_snapshot(
+            "usage-thread",
+            Some("Usage"),
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let row = build_list_row(&thread, 0, Utc::now());
+        let observed_at = Utc::now();
+        let account_usage = Observed {
+            value: Some(AccountUsage {
+                primary: Some(AccountUsageWindow {
+                    used_percent: Some(44.0),
+                    window_minutes: Some(10_080),
+                    resets_at: Some(observed_at + Duration::hours(1)),
+                }),
+                secondary: Some(AccountUsageWindow {
+                    used_percent: Some(25.0),
+                    window_minutes: Some(300),
+                    resets_at: Some(observed_at + Duration::hours(1)),
+                }),
+            }),
+            source: None,
+            observed_at: Some(observed_at),
+            confidence: Confidence::High,
+            detail: None,
+        };
+
+        for width in [120, 100, 80, 60] {
+            let backend = TestBackend::new(width, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let rows = vec![row.clone()];
+                    render_tui_view(
+                        frame,
+                        frame.area(),
+                        &TuiViewState {
+                            visible_rows: &rows,
+                            selected_snapshot: Some(&thread),
+                            counts: &StateCounts {
+                                running: 1,
+                                idle: 2,
+                                done: 3,
+                                failed: 4,
+                            },
+                            account_usage: &account_usage,
+                            selected: 0,
+                            state_filter: &LocalStateFilter::All,
+                            last_refresh_label: "just now",
+                            show_activity: false,
+                            show_technical: false,
+                            show_help: false,
+                            search_mode: false,
+                            search_query: "",
+                        },
+                    );
+                })
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Codex Agent Monitor"), "width {width}");
+            assert!(rendered.contains("Usage left:"), "width {width}");
+            assert!(rendered.contains("Weekly 56%"), "width {width}");
+            assert!(rendered.contains("5h 75%"), "width {width}");
+            assert!(rendered.contains("observed just now"), "width {width}");
+            assert!(rendered.contains("Auto-refresh"), "width {width}");
+            assert!(rendered.contains("RUNNING"), "width {width}");
+            assert!(rendered.contains("IDLE"), "width {width}");
+            assert!(rendered.contains("DONE"), "width {width}");
+            assert!(rendered.contains("FAILED"), "width {width}");
+        }
+    }
+
+    #[test]
+    fn usage_header_shows_window_labels_unknown_and_expired_values() {
+        let now = Utc::now();
+        let usage = Observed {
+            value: Some(AccountUsage {
+                primary: Some(AccountUsageWindow {
+                    used_percent: Some(120.0),
+                    window_minutes: Some(10_080),
+                    resets_at: Some(now + Duration::hours(1)),
+                }),
+                secondary: Some(AccountUsageWindow {
+                    used_percent: None,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+            }),
+            source: None,
+            observed_at: Some(now),
+            confidence: Confidence::High,
+            detail: None,
+        };
+        let line = account_usage_line(&usage, now);
+        assert!(line.contains("Weekly 0%"));
+        assert!(line.contains("5h unavailable"));
+
+        let expired = Observed {
+            value: Some(AccountUsage {
+                primary: Some(AccountUsageWindow {
+                    used_percent: Some(0.0),
+                    window_minutes: Some(300),
+                    resets_at: Some(now - Duration::seconds(1)),
+                }),
+                secondary: None,
+            }),
+            source: None,
+            observed_at: Some(now),
+            confidence: Confidence::High,
+            detail: None,
+        };
+        assert!(account_usage_line(&expired, now).contains("5h awaiting update"));
+        assert_eq!(
+            account_usage_line(&Observed::unknown(), now),
+            "Usage left: unavailable"
+        );
     }
 
     #[test]
@@ -1962,6 +2178,7 @@ mod tests {
                             done: 0,
                             failed: 0,
                         },
+                        account_usage: &Observed::unknown(),
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
                         last_refresh_label: "just now",

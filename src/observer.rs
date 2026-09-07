@@ -12,8 +12,9 @@ use crate::config::{
 };
 use crate::db::DbThreadRecord;
 use crate::model::{
-    Confidence, EvidenceSource, ModelSpec, ModelSummary, Observed, ProbeEnvironment, ProbeOutput,
-    QueryInfo, ThreadActivity, ThreadEvidence, ThreadSnapshot, ThreadState, TokenUsage,
+    AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, ModelSpec, ModelSummary,
+    Observed, ProbeEnvironment, ProbeOutput, QueryInfo, ThreadActivity, ThreadEvidence,
+    ThreadSnapshot, ThreadState, TokenUsage,
 };
 use crate::rollout::{RolloutParseResult, RolloutStateHint};
 use crate::runtime::RuntimeOverlay;
@@ -259,6 +260,8 @@ impl Monitor {
         }
         let tree = crate::tree::build_thread_tree(&ids, &out_edges);
 
+        let account_usage = account_usage_observation(&rollouts);
+
         let mut combined_warnings = Vec::new();
         combined_warnings.extend(warnings);
         combined_warnings.extend(runtime.warnings);
@@ -281,9 +284,41 @@ impl Monitor {
                 depth: filters.depth,
             },
             warnings: combined_warnings,
+            account_usage,
             threads: thread_rows,
             tree,
         })
+    }
+}
+
+fn account_usage_observation(
+    rollouts: &HashMap<String, RolloutParseResult>,
+) -> Observed<AccountUsage> {
+    let Some(observation) = rollouts
+        .values()
+        .filter_map(|rollout| rollout.account_usage.as_ref())
+        .max_by_key(|observation| observation.observed_at)
+    else {
+        return Observed::unknown();
+    };
+
+    let convert = |window: &crate::rollout::RolloutAccountUsageWindow| AccountUsageWindow {
+        used_percent: window.used_percent,
+        window_minutes: window.window_minutes,
+        resets_at: window.resets_at,
+    };
+    Observed {
+        value: Some(AccountUsage {
+            primary: observation.primary.as_ref().map(convert),
+            secondary: observation.secondary.as_ref().map(convert),
+        }),
+        source: Some(EvidenceSource {
+            kind: observation.source.clone(),
+            detail: Some("latest timestamped account rate limit observation".to_string()),
+        }),
+        observed_at: Some(observation.observed_at),
+        confidence: Confidence::High,
+        detail: Some("account allowance from monitored rollout evidence".to_string()),
     }
 }
 
@@ -930,6 +965,46 @@ mod tests {
     }
 
     #[test]
+    fn account_usage_observation_selects_latest_rollout_timestamp() {
+        let older = RolloutParseResult {
+            account_usage: Some(crate::rollout::RolloutAccountUsageObservation {
+                primary: Some(crate::rollout::RolloutAccountUsageWindow {
+                    used_percent: Some(10.0),
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: None,
+                source: "rollout.rate_limits".into(),
+                observed_at: Utc.timestamp_opt(1_720_000_100, 0).unwrap(),
+            }),
+            ..Default::default()
+        };
+        let newer = RolloutParseResult {
+            account_usage: Some(crate::rollout::RolloutAccountUsageObservation {
+                primary: Some(crate::rollout::RolloutAccountUsageWindow {
+                    used_percent: Some(44.0),
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                secondary: None,
+                source: "rollout.rate_limits".into(),
+                observed_at: Utc.timestamp_opt(1_720_000_200, 0).unwrap(),
+            }),
+            ..Default::default()
+        };
+        let rollouts = HashMap::from([("older".into(), older), ("newer".into(), newer)]);
+        let observed = account_usage_observation(&rollouts);
+        assert_eq!(
+            observed.observed_at,
+            Some(Utc.timestamp_opt(1_720_000_200, 0).unwrap())
+        );
+        assert_eq!(
+            observed.value.unwrap().primary.unwrap().used_percent,
+            Some(44.0)
+        );
+    }
+
+    #[test]
     fn configured_model_missing_remains_unknown() {
         let cfg = crate::config::ConfigContext {
             global: None,
@@ -1016,6 +1091,7 @@ mod tests {
             canonical_meta_seen: true,
             requested_model: None,
             token_usage: None,
+            account_usage: None,
             canonical_meta_timestamp: None,
             warnings: vec![],
             activity: vec![],
@@ -1114,6 +1190,7 @@ mod tests {
                 depth: None,
             },
             warnings: vec![],
+            account_usage: Observed::unknown(),
             threads: vec![snapshot],
             tree: Vec::new(),
         };
