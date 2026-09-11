@@ -19,6 +19,12 @@
 
 No writes are made to Codex files, DB, or runtime processes.
 
+The JSON schema is `codex-agent-monitor.probe.v2`. Current thread state is
+limited to `running`, `idle`, and `unknown`; terminal lifecycle results are
+retained separately as `last_terminal_event`. A shared 15-minute freshness
+window drives the evidence-aware `activity_signal` (`recent`, `stale`, or
+`unknown`) without asserting that activity means a running thread.
+
 ## Read-only database behavior
 
 SQLite is opened with:
@@ -47,6 +53,8 @@ Parsing rules:
 - later copied metadata snapshots are ignored if `id` mismatches canonical identity
 - malformed lines are diagnosed and skipped
 - one-shot parsing allows a clean trailing unterminated record only with warning; otherwise tail malformed record is skipped and marked
+- `task_complete`, `task_done`, and `turn_aborted` produce current `idle` state while preserving completed, failed, or interrupted terminal evidence
+- a rollout ending in a start event remains `running`; old or missing lifecycle timestamps lower state evidence confidence
 
 ## Model/evidence precedence
 
@@ -73,6 +81,8 @@ Parent inference is two-phase with deterministic precedence:
 3. canonical session metadata (`payload.parent_thread_id` and `source.subagent` fallback paths)
 
 Each candidate edge is cycle-checked before insertion. Orphans remain roots.
+Explicit duplicate-child edges use a deterministic parent tie-breaker, and
+visited guards bound depth/tree traversal even for cyclic input.
 
 ## Activity parsing
 
@@ -103,12 +113,14 @@ Long-running refresh in `watch` is implemented as efficient polling with rollout
 - per-thread rollout parsing is cached by `(path, size, mtime)`
 - unchanged files are not reparsed every cycle
 - runtime overlay is refreshed from file once per cycle; stdin stream is rejected for watch to avoid blocking
+- Codex CLI path/version detection is performed once when `Monitor` is created
 
 ## TUI behavior
 
 - hierarchy rendering from built tree
 - shows configured/requested/effective model and effort separately
 - shows source labels for evidence (`state`, `nickname`, `role`, `parent`, `cwd`, `source_kind`)
+- shows `RUNNING`/`IDLE`/`UNKNOWN` summaries plus latest terminal/activity evidence
 - no mutation controls (read-only only)
 
 ## CLI/runtime limits
@@ -117,3 +129,6 @@ Long-running refresh in `watch` is implemented as efficient polling with rollout
 - `--runtime-events -` in `watch` returns explicit error
 - unknown runtime notification types are ignored with warning
 - runtime updates are not persisted and do not imply durability
+
+Only Codex CLI `0.144.5` is explicitly validated. Parser shape tolerance is
+intentional compatibility handling, not a supported version range.

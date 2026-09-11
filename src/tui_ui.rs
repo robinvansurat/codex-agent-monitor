@@ -21,8 +21,8 @@ use ratatui::{
 
 use crate::cli::FilterOpts;
 use crate::model::{
-    AccountUsage, AccountUsageWindow, Observed, ThreadSnapshot, ThreadState, ThreadTreeNode,
-    TokenUsage,
+    AccountUsage, AccountUsageWindow, ActivitySignal, LastTerminalEvent, Observed, ThreadSnapshot,
+    ThreadState, ThreadTreeNode, TokenUsage,
 };
 use crate::observer::Monitor;
 use crate::runtime::RuntimeOverlay;
@@ -36,8 +36,6 @@ const AGENT_CARD_LINES: usize = 6;
 enum StateBucket {
     Running,
     Idle,
-    Done,
-    Failed,
     Other,
 }
 
@@ -430,10 +428,8 @@ fn render_header(
         Span::styled(format!("{}  ", counts.running), Style::default()),
         Span::styled("IDLE ", Style::default().fg(Color::Rgb(255, 172, 51))),
         Span::styled(format!("{}  ", counts.idle), Style::default()),
-        Span::styled("DONE ", Style::default().fg(Color::Gray)),
-        Span::styled(format!("{}  ", counts.done), Style::default()),
-        Span::styled("FAILED ", Style::default().fg(Color::Red)),
-        Span::styled(format!("{}", counts.failed), Style::default()),
+        Span::styled("UNKNOWN ", Style::default().fg(Color::Gray)),
+        Span::styled(format!("{}", counts.unknown), Style::default()),
     ]);
 
     if is_wide {
@@ -766,9 +762,7 @@ fn render_details_pane(
 
     let (model, effort) = preferred_model_and_effort(selected);
     let (origin, cwd_path) = origin_label(selected.cwd.as_deref());
-    let state_text = human_state_label(
-        state_label(selected.state.clone(), selected.state_detail.as_deref()).as_str(),
-    );
+    let state_text = human_state_label(state_label(selected.state.clone()).as_str());
     let age = format_time_delta(last_update_for_thread(selected), Utc::now());
 
     let mut lines = Vec::new();
@@ -781,7 +775,7 @@ fn render_details_pane(
             state_text,
             state_style(
                 selected.state.clone(),
-                bucket_for_state(selected.state.clone(), selected.state_detail.as_deref()),
+                bucket_for_state(selected.state.clone()),
             ),
         ),
         Span::styled(format!(" • {}", age), Style::default().fg(Color::DarkGray)),
@@ -795,6 +789,12 @@ fn render_details_pane(
     )));
     lines.push(Line::from(current_activity_line(selected)));
     lines.push(horizontal_divider(inner.width));
+    if let Some(event) = selected.last_terminal_event.value.as_ref() {
+        lines.push(Line::from(format!(
+            "Last terminal result: {}",
+            terminal_event_label(event)
+        )));
+    }
 
     if is_wide {
         let total_width = inner.width as usize;
@@ -816,7 +816,7 @@ fn render_details_pane(
         lines.push(Line::from(format!(
             "{:<width$}{:<width2$}",
             model,
-            format!("{}", effort),
+            effort.to_string(),
             width = model_col,
             width2 = effort_col.max(1),
         )));
@@ -894,15 +894,30 @@ fn render_details_pane(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
+        if let Some(event) = selected.last_terminal_event.value.as_ref() {
+            let source = selected
+                .last_terminal_event
+                .source
+                .as_ref()
+                .map(|value| value.kind.as_str())
+                .unwrap_or("unknown");
+            let observed_at = selected
+                .last_terminal_event
+                .observed_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(Line::from(format!(
+                "Terminal evidence: {} source={} observed_at={} confidence={:?}",
+                terminal_event_label(event),
+                source,
+                observed_at,
+                selected.last_terminal_event.confidence
+            )));
+        }
         lines.push(Line::from(format!("Full UUID: {}", selected.thread_id)));
         lines.push(Line::from(format!("Detected origin: {}", origin)));
         if !cwd_path.is_empty() {
             lines.push(Line::from(format!("Full path: {}", cwd_path)));
-        }
-        if let Some(state_detail) = &selected.state_detail {
-            if !state_detail.is_empty() {
-                lines.push(Line::from(format!("Detail: {}", state_detail)));
-            }
         }
         if let Some(rollout_path) = &selected.rollout_path {
             lines.push(Line::from(format!("Rollout path: {}", rollout_path)));
@@ -931,17 +946,18 @@ fn horizontal_divider(width: u16) -> Line<'static> {
 
 fn human_state_label(state_label: &str) -> &'static str {
     match state_label {
-        "DONE" => "Done",
         "RUNNING" => "Running",
         "IDLE" => "Idle",
-        "FAILED" => "Failed",
-        "INTERRUPTED" => "Interrupted",
         "UNKNOWN" => "Unknown",
         _ => "Unknown",
     }
 }
 
 fn current_activity_line(thread: &ThreadSnapshot) -> String {
+    let signal = format!(
+        " [activity: {}]",
+        activity_signal_label(&thread.activity_signal)
+    );
     if let Some(activity) = thread.recent_activity.last() {
         let kind = activity.kind.replace('_', " ");
         let tool = activity
@@ -954,13 +970,25 @@ fn current_activity_line(thread: &ThreadSnapshot) -> String {
             .clone()
             .unwrap_or_else(|| "-".to_string())
             .replace('_', " ");
-        format!("{} {} {}", kind, tool, status)
+        format!("{} {} {}{}", kind, tool, status, signal)
     } else {
-        thread
-            .state_detail
-            .clone()
-            .map(|detail| format!("detail: {}", detail.replace('_', " ")))
-            .unwrap_or_else(|| "-".to_string())
+        state_label(thread.state.clone()) + &signal
+    }
+}
+
+fn activity_signal_label(signal: &Observed<ActivitySignal>) -> &'static str {
+    match signal.value {
+        Some(ActivitySignal::Recent) => "recent",
+        Some(ActivitySignal::Stale) => "stale",
+        Some(ActivitySignal::Unknown) | None => "unknown",
+    }
+}
+
+fn terminal_event_label(event: &LastTerminalEvent) -> &'static str {
+    match event {
+        LastTerminalEvent::Completed => "completed",
+        LastTerminalEvent::Failed => "failed",
+        LastTerminalEvent::Interrupted => "interrupted",
     }
 }
 
@@ -985,27 +1013,15 @@ fn last_update_for_thread(thread: &ThreadSnapshot) -> Option<DateTime<Utc>> {
 fn state_style(state: ThreadState, bucket: StateBucket) -> Style {
     match (state, bucket) {
         (ThreadState::Running, _) => Style::default().fg(Color::Green),
-        (ThreadState::Idle, StateBucket::Done) => Style::default().fg(Color::DarkGray),
         (ThreadState::Idle, _) => Style::default().fg(Color::Rgb(255, 172, 51)),
-        (ThreadState::Interrupted, _) => Style::default().fg(Color::Red),
-        (ThreadState::Failed, _) => Style::default().fg(Color::Red),
-        (_, StateBucket::Done) => Style::default().fg(Color::DarkGray),
         _ => Style::default().fg(Color::DarkGray),
     }
 }
 
-fn bucket_for_state(state: ThreadState, state_detail: Option<&str>) -> StateBucket {
-    let completed = matches!(
-        state_detail,
-        Some(value) if value.eq_ignore_ascii_case("turn_completed")
-    );
+fn bucket_for_state(state: ThreadState) -> StateBucket {
     match state {
         ThreadState::Running => StateBucket::Running,
-        ThreadState::Idle if completed => StateBucket::Done,
         ThreadState::Idle => StateBucket::Idle,
-        ThreadState::Failed => StateBucket::Failed,
-        ThreadState::Interrupted => StateBucket::Other,
-        ThreadState::Done => StateBucket::Other,
         ThreadState::Unknown => StateBucket::Other,
     }
 }
@@ -1015,8 +1031,8 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
     let (origin_label, _) = origin_label(thread.cwd.as_deref());
     let short_id = short_id(&thread.thread_id);
     let age_label = format_time_delta(last_update_for_thread(thread), now);
-    let bucket = bucket_for_state(thread.state.clone(), thread.state_detail.as_deref());
-    let state_label = state_label(thread.state.clone(), thread.state_detail.as_deref());
+    let bucket = bucket_for_state(thread.state.clone());
+    let state_label = state_label(thread.state.clone());
     ListRow {
         thread_id: thread.thread_id.clone(),
         state: thread.state.clone(),
@@ -1107,9 +1123,7 @@ fn count_buckets(rows: &[ListRow]) -> StateCounts {
         match row.state_bucket {
             StateBucket::Running => counts.running += 1,
             StateBucket::Idle => counts.idle += 1,
-            StateBucket::Done => counts.done += 1,
-            StateBucket::Failed => counts.failed += 1,
-            StateBucket::Other => {}
+            StateBucket::Other => counts.unknown += 1,
         }
     }
     counts
@@ -1148,7 +1162,7 @@ fn visible_rows_for_filter(
     if matches!(state_filter, LocalStateFilter::Running) {
         // Vec::sort_by is stable, so the existing tree order remains the
         // deterministic fallback for ties and unknown timestamps.
-        visible_rows.sort_by(|left, right| right.last_update.cmp(&left.last_update));
+        visible_rows.sort_by_key(|row| std::cmp::Reverse(row.last_update));
     }
     visible_rows
 }
@@ -1205,18 +1219,11 @@ fn format_time_delta(ts: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     }
 }
 
-fn state_label(state: ThreadState, state_detail: Option<&str>) -> String {
-    if matches!(state, ThreadState::Idle) && state_detail == Some("turn_completed") {
-        "DONE"
-    } else {
-        match state {
-            ThreadState::Running => "RUNNING",
-            ThreadState::Idle => "IDLE",
-            ThreadState::Interrupted => "INTERRUPTED",
-            ThreadState::Failed => "FAILED",
-            ThreadState::Done => "DONE",
-            ThreadState::Unknown => "UNKNOWN",
-        }
+fn state_label(state: ThreadState) -> String {
+    match state {
+        ThreadState::Running => "RUNNING",
+        ThreadState::Idle => "IDLE",
+        ThreadState::Unknown => "UNKNOWN",
     }
     .to_string()
 }
@@ -1312,8 +1319,7 @@ fn collect_tree_nodes(
 struct StateCounts {
     running: usize,
     idle: usize,
-    done: usize,
-    failed: usize,
+    unknown: usize,
 }
 
 fn pressed_key_event(event: Event) -> Option<KeyEvent> {
@@ -1360,7 +1366,8 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use crate::model::{
-        AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, ModelSpec, TokenUsage,
+        AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, LastTerminalEvent, ModelSpec,
+        TokenUsage,
     };
     use chrono::Duration;
     use chrono::Utc;
@@ -1378,7 +1385,7 @@ mod tests {
         role: Option<&str>,
         parent_thread_id: Option<&str>,
         state: ThreadState,
-        state_detail: Option<&str>,
+        _state_detail: Option<&str>,
         cwd: Option<&str>,
         effective: Option<(&str, &str)>,
         requested: Option<(&str, &str)>,
@@ -1394,7 +1401,8 @@ mod tests {
             children: Vec::new(),
             project: None,
             state: state.clone(),
-            state_detail: state_detail.map(std::string::ToString::to_string),
+            last_terminal_event: crate::model::Observed::unknown(),
+            activity_signal: crate::model::Observed::unknown(),
             model: crate::model::ModelSummary {
                 configured: crate::model::Observed {
                     value: configured.map(|(m, e)| ModelSpec {
@@ -1625,7 +1633,8 @@ mod tests {
             children: Vec::new(),
             project: None,
             state: ThreadState::Running,
-            state_detail: Some("running".to_string()),
+            last_terminal_event: crate::model::Observed::unknown(),
+            activity_signal: crate::model::Observed::unknown(),
             model: crate::model::ModelSummary {
                 configured: crate::model::Observed {
                     value: None,
@@ -1783,6 +1792,16 @@ mod tests {
                 timestamp: Some(Utc::now()),
             },
         ];
+        thread_with_activity.last_terminal_event = Observed {
+            value: Some(LastTerminalEvent::Completed),
+            source: Some(EvidenceSource {
+                kind: "rollout.lifecycle".to_string(),
+                detail: Some("latest terminal lifecycle event".to_string()),
+            }),
+            observed_at: Some(Utc::now()),
+            confidence: Confidence::Medium,
+            detail: None,
+        };
         let display = display_name(&thread_with_activity);
         let short_id = short_id(&thread_with_activity.thread_id);
         let backend = TestBackend::new(160, 48);
@@ -1799,8 +1818,7 @@ mod tests {
                         counts: &StateCounts {
                             running: 1,
                             idle: 0,
-                            done: 0,
-                            failed: 0,
+                            unknown: 0,
                         },
                         account_usage: &Observed::unknown(),
                         selected: 0,
@@ -1874,6 +1892,7 @@ mod tests {
         assert!(right_rendered.contains("Model"));
         assert!(right_rendered.contains("Effort"));
         assert!(right_rendered.contains("Current activity"));
+        assert!(right_rendered.contains("Last terminal result: completed"));
         assert!(right_rendered.contains("Technical details"));
         assert!(right_rendered.contains("Press i to expand"));
         assert!(right_rendered.contains("Running"));
@@ -1888,8 +1907,8 @@ mod tests {
         assert!(right_rendered.contains("tool call"));
         assert!(full_rendered.contains("RUNNING"));
         assert!(full_rendered.contains("IDLE"));
-        assert!(full_rendered.contains("DONE"));
-        assert!(full_rendered.contains("FAILED"));
+        assert!(!full_rendered.contains("DONE"));
+        assert!(!full_rendered.contains("FAILED"));
 
         let right_lines: Vec<&str> = right_rendered.lines().collect();
         let model = &row.model;
@@ -1987,8 +2006,7 @@ mod tests {
                         counts: &StateCounts {
                             running: 1,
                             idle: 0,
-                            done: 0,
-                            failed: 0,
+                            unknown: 0,
                         },
                         account_usage: &Observed::unknown(),
                         selected: 0,
@@ -2064,8 +2082,7 @@ mod tests {
                             counts: &StateCounts {
                                 running: 1,
                                 idle: 2,
-                                done: 3,
-                                failed: 4,
+                                unknown: 7,
                             },
                             account_usage: &account_usage,
                             selected: 0,
@@ -2095,8 +2112,7 @@ mod tests {
             assert!(rendered.contains("Auto-refresh"), "width {width}");
             assert!(rendered.contains("RUNNING"), "width {width}");
             assert!(rendered.contains("IDLE"), "width {width}");
-            assert!(rendered.contains("DONE"), "width {width}");
-            assert!(rendered.contains("FAILED"), "width {width}");
+            assert!(rendered.contains("UNKNOWN"), "width {width}");
         }
     }
 
@@ -2175,8 +2191,7 @@ mod tests {
                         counts: &StateCounts {
                             running: 1,
                             idle: 0,
-                            done: 0,
-                            failed: 0,
+                            unknown: 0,
                         },
                         account_usage: &Observed::unknown(),
                         selected: 0,
@@ -2255,15 +2270,8 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_and_unknown_states_keep_factual_labels() {
-        assert_eq!(
-            state_label(ThreadState::Interrupted, None),
-            "INTERRUPTED".to_string()
-        );
-        assert_eq!(
-            state_label(ThreadState::Unknown, None),
-            "UNKNOWN".to_string()
-        );
+    fn unknown_state_keeps_factual_label() {
+        assert_eq!(state_label(ThreadState::Unknown), "UNKNOWN".to_string());
     }
 
     #[test]
@@ -2338,7 +2346,7 @@ mod tests {
     }
 
     #[test]
-    fn done_bucket_uses_idle_and_turn_completed_only() {
+    fn terminal_detail_does_not_create_a_state_bucket() {
         let done = make_snapshot(
             "done",
             None,
@@ -2351,10 +2359,7 @@ mod tests {
             None,
             None,
         );
-        assert!(matches!(
-            bucket_for_state(done.state, done.state_detail.as_deref()),
-            StateBucket::Done
-        ));
+        assert!(matches!(bucket_for_state(done.state), StateBucket::Idle));
 
         let not_done = make_snapshot(
             "notdone",
@@ -2369,7 +2374,7 @@ mod tests {
             None,
         );
         assert!(matches!(
-            bucket_for_state(not_done.state, not_done.state_detail.as_deref()),
+            bucket_for_state(not_done.state),
             StateBucket::Idle
         ));
     }

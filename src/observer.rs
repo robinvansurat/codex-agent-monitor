@@ -12,19 +12,22 @@ use crate::config::{
 };
 use crate::db::DbThreadRecord;
 use crate::model::{
-    AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, ModelSpec, ModelSummary,
-    Observed, ProbeEnvironment, ProbeOutput, QueryInfo, ThreadActivity, ThreadEvidence,
-    ThreadSnapshot, ThreadState, TokenUsage,
+    AccountUsage, AccountUsageWindow, ActivitySignal, Confidence, EvidenceSource,
+    LastTerminalEvent, ModelSpec, ModelSummary, Observed, ProbeEnvironment, ProbeOutput, QueryInfo,
+    ThreadActivity, ThreadEvidence, ThreadSnapshot, ThreadState, TokenUsage,
 };
-use crate::rollout::{RolloutParseResult, RolloutStateHint};
+use crate::rollout::{RolloutParseResult, RolloutStateHint, RolloutTerminalEvent};
 use crate::runtime::RuntimeOverlay;
 
 #[derive(Debug)]
 pub struct Monitor {
     pub codex_home: PathBuf,
     pub config: crate::config::ConfigContext,
+    environment: ProbeEnvironment,
     rollout_cache: HashMap<PathBuf, CachedRollout>,
 }
+
+pub const FRESHNESS_WINDOW_MINUTES: i64 = 15;
 
 #[derive(Debug, Clone)]
 struct CachedRollout {
@@ -40,6 +43,7 @@ impl Monitor {
         Ok(Monitor {
             codex_home: home,
             config,
+            environment: detect_environment(),
             rollout_cache: HashMap::new(),
         })
     }
@@ -135,7 +139,8 @@ impl Monitor {
             if !selected_ids.contains(&thread.id) {
                 continue;
             }
-            let hint_state = rollouts.get(&thread.id).map(|r| r.final_state);
+            let parsed_rollout = rollouts.get(&thread.id);
+            let hint_state = parsed_rollout.map(|r| r.final_state);
             let state = map_state(hint_state);
             if let Some(state_filter) = &filters.state {
                 if !applies_state(state_filter, &state) {
@@ -158,7 +163,7 @@ impl Monitor {
                 effective = value.clone();
             }
             let mut activity = Vec::new();
-            if let Some(parsed) = rollouts.get(&thread.id) {
+            if let Some(parsed) = parsed_rollout {
                 let mut reversed = parsed.activity.iter().rev().take(25).collect::<Vec<_>>();
                 reversed.reverse();
                 for act in reversed {
@@ -171,16 +176,9 @@ impl Monitor {
                 }
             }
 
-            let (thread_state, state_detail) = match state {
-                ThreadState::Done => (ThreadState::Idle, Some("turn_completed".to_string())),
-                ThreadState::Idle => (ThreadState::Idle, Some("idle".to_string())),
-                ThreadState::Running => (ThreadState::Running, Some("running".to_string())),
-                ThreadState::Failed => (ThreadState::Failed, Some("failed".to_string())),
-                ThreadState::Interrupted => {
-                    (ThreadState::Interrupted, Some("interrupted".to_string()))
-                }
-                ThreadState::Unknown => (ThreadState::Unknown, Some("unknown".to_string())),
-            };
+            let thread_state = state;
+            let last_terminal_event = last_terminal_event_observation(parsed_rollout);
+            let activity_signal = activity_signal_observation(thread, parsed_rollout);
 
             let mut children = Vec::new();
             for (child, parent) in &parent_of {
@@ -191,7 +189,7 @@ impl Monitor {
             children.sort_unstable();
             let parent_thread_id = parent_of.get(&thread.id).cloned();
             let parent_source = parent_sources.get(&thread.id).copied();
-            let evidence = thread_evidence(
+            let mut evidence = thread_evidence(
                 thread,
                 parent_thread_id.clone(),
                 parent_source,
@@ -199,6 +197,9 @@ impl Monitor {
                 thread_state.clone(),
                 &activity,
             );
+            let lifecycle_at = parsed_rollout.and_then(|rollout| rollout.final_state_at);
+            evidence.state.observed_at = lifecycle_at;
+            evidence.state.confidence = state_confidence(&thread_state, lifecycle_at);
             let nickname = evidence.nickname.value.clone();
             let role = evidence.role.value.clone();
             let parent_thread_id = evidence.parent_thread_id.value.clone();
@@ -215,7 +216,8 @@ impl Monitor {
                 children,
                 project: thread_project(thread),
                 state: thread_state.clone(),
-                state_detail,
+                last_terminal_event,
+                activity_signal,
                 model: ModelSummary {
                     configured,
                     requested,
@@ -237,11 +239,7 @@ impl Monitor {
             });
         }
 
-        thread_rows.sort_by(|a, b| {
-            b.recency_at
-                .unwrap_or_else(Utc::now)
-                .cmp(&a.recency_at.unwrap_or_else(Utc::now))
-        });
+        thread_rows.sort_by(compare_recency_then_id);
         if let Some(depth) = filters.depth {
             thread_rows = apply_depth_filter(thread_rows, &parent_of, depth);
         }
@@ -265,13 +263,11 @@ impl Monitor {
         let mut combined_warnings = Vec::new();
         combined_warnings.extend(warnings);
         combined_warnings.extend(runtime.warnings);
-        let environment = detect_environment();
-
         Ok(ProbeOutput {
-            schema_version: "codex-agent-monitor.probe.v1".to_string(),
+            schema_version: "codex-agent-monitor.probe.v2".to_string(),
             generated_at: Utc::now(),
             codex_home: self.codex_home.display().to_string(),
-            environment,
+            environment: self.environment.clone(),
             query: QueryInfo {
                 include_all: filters.all,
                 project: filters.project.clone(),
@@ -565,12 +561,29 @@ fn matches_recent_filter(thread: &DbThreadRecord, cutoff: &Option<DateTime<Utc>>
     true
 }
 
+fn compare_recency_then_id(a: &ThreadSnapshot, b: &ThreadSnapshot) -> std::cmp::Ordering {
+    compare_recency_values(a.recency_at, &a.thread_id, b.recency_at, &b.thread_id)
+}
+
+fn compare_recency_values(
+    a_recency: Option<DateTime<Utc>>,
+    a_id: &str,
+    b_recency: Option<DateTime<Utc>>,
+    b_id: &str,
+) -> std::cmp::Ordering {
+    match (a_recency, b_recency) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a_id.cmp(b_id),
+    }
+    .then_with(|| a_id.cmp(b_id))
+}
+
 fn applies_state(filter: &ThreadStateFilter, state: &ThreadState) -> bool {
     match filter {
         ThreadStateFilter::Running => matches!(state, ThreadState::Running),
-        ThreadStateFilter::Idle => matches!(state, ThreadState::Idle | ThreadState::Done),
-        ThreadStateFilter::Interrupted => matches!(state, ThreadState::Interrupted),
-        ThreadStateFilter::Failed => matches!(state, ThreadState::Failed),
+        ThreadStateFilter::Idle => matches!(state, ThreadState::Idle),
         ThreadStateFilter::Unknown => matches!(state, ThreadState::Unknown),
     }
 }
@@ -579,10 +592,123 @@ fn map_state(hint: Option<RolloutStateHint>) -> ThreadState {
     match hint.unwrap_or(RolloutStateHint::Unknown) {
         RolloutStateHint::Running => ThreadState::Running,
         RolloutStateHint::Idle => ThreadState::Idle,
-        RolloutStateHint::TurnCompleted => ThreadState::Done,
-        RolloutStateHint::Interrupted => ThreadState::Interrupted,
-        RolloutStateHint::Failed => ThreadState::Failed,
+        RolloutStateHint::TurnCompleted
+        | RolloutStateHint::Interrupted
+        | RolloutStateHint::Failed => ThreadState::Idle,
         RolloutStateHint::Unknown => ThreadState::Unknown,
+    }
+}
+
+fn state_confidence(state: &ThreadState, lifecycle_at: Option<DateTime<Utc>>) -> Confidence {
+    state_confidence_at(state, lifecycle_at, Utc::now())
+}
+
+fn state_confidence_at(
+    state: &ThreadState,
+    lifecycle_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Confidence {
+    if matches!(state, ThreadState::Unknown) {
+        return Confidence::Low;
+    }
+    match lifecycle_at {
+        Some(timestamp) if timestamp >= now - ChronoDuration::minutes(FRESHNESS_WINDOW_MINUTES) => {
+            Confidence::Medium
+        }
+        _ => Confidence::Low,
+    }
+}
+
+fn last_terminal_event_observation(
+    rollout: Option<&RolloutParseResult>,
+) -> Observed<LastTerminalEvent> {
+    let Some(rollout) = rollout else {
+        return Observed::unknown();
+    };
+    let Some(observation) = rollout.last_terminal_event else {
+        return Observed::unknown();
+    };
+    let value = match observation.event {
+        RolloutTerminalEvent::Completed => LastTerminalEvent::Completed,
+        RolloutTerminalEvent::Failed => LastTerminalEvent::Failed,
+        RolloutTerminalEvent::Interrupted => LastTerminalEvent::Interrupted,
+    };
+    let observed_at = observation.observed_at;
+    Observed {
+        value: Some(value),
+        source: Some(EvidenceSource {
+            kind: "rollout.lifecycle".to_string(),
+            detail: Some("latest terminal lifecycle event".to_string()),
+        }),
+        observed_at,
+        confidence: Confidence::Medium,
+        detail: Some("terminal result does not change current state".to_string()),
+    }
+}
+
+fn activity_signal_observation(
+    thread: &DbThreadRecord,
+    rollout: Option<&RolloutParseResult>,
+) -> Observed<ActivitySignal> {
+    activity_signal_observation_at(thread, rollout, Utc::now())
+}
+
+fn activity_signal_observation_at(
+    thread: &DbThreadRecord,
+    rollout: Option<&RolloutParseResult>,
+    now: DateTime<Utc>,
+) -> Observed<ActivitySignal> {
+    let rollout_timestamp = rollout.and_then(|value| {
+        [value.latest_activity_at, value.latest_lifecycle_at]
+            .into_iter()
+            .flatten()
+            .max()
+    });
+    let (timestamp, source) = rollout_timestamp
+        .map(|value| (Some(value), "rollout.activity"))
+        .unwrap_or_else(|| {
+            (
+                thread
+                    .recency_at
+                    .or(thread.updated_at)
+                    .or(thread.created_at),
+                "threads-table",
+            )
+        });
+    let Some(timestamp) = timestamp else {
+        return Observed {
+            value: Some(ActivitySignal::Unknown),
+            source: Some(EvidenceSource {
+                kind: "unknown".to_string(),
+                detail: Some("no rollout or database activity timestamp".to_string()),
+            }),
+            observed_at: None,
+            confidence: Confidence::Low,
+            detail: Some("activity freshness unavailable".to_string()),
+        };
+    };
+    let recent = timestamp >= now - ChronoDuration::minutes(FRESHNESS_WINDOW_MINUTES);
+    Observed {
+        value: Some(if recent {
+            ActivitySignal::Recent
+        } else {
+            ActivitySignal::Stale
+        }),
+        source: Some(EvidenceSource {
+            kind: source.to_string(),
+            detail: Some("latest available activity timestamp".to_string()),
+        }),
+        observed_at: Some(timestamp),
+        confidence: if source == "threads-table" {
+            Confidence::Low
+        } else {
+            Confidence::Medium
+        },
+        detail: Some(if recent {
+            "activity is within freshness window".to_string()
+        } else {
+            "activity is older than freshness window".to_string()
+        }),
     }
 }
 
@@ -839,7 +965,11 @@ fn apply_depth_filter(
         .filter(|thread| {
             let mut current = thread.thread_id.as_str();
             let mut depth = 0usize;
+            let mut visited = HashSet::new();
             while let Some(parent) = parent_of.get(current) {
+                if !visited.insert(current) {
+                    return false;
+                }
                 depth += 1;
                 if depth > max_depth {
                     return false;
@@ -865,6 +995,30 @@ mod tests {
     #[cfg(windows)]
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_thread() -> DbThreadRecord {
+        DbThreadRecord {
+            id: "thread".into(),
+            rollout_path: None,
+            created_at: None,
+            updated_at: None,
+            recency_at: None,
+            source: None,
+            thread_source: None,
+            model: None,
+            reasoning_effort: None,
+            agent_nickname: None,
+            agent_role: None,
+            agent_path: None,
+            cwd: None,
+            source_kind: None,
+            raw: HashMap::new(),
+        }
+    }
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).unwrap()
+    }
+
     #[test]
     fn applies_state_filter_matches_aliases() {
         assert!(crate::observer::applies_state(
@@ -879,14 +1033,150 @@ mod tests {
             &ThreadStateFilter::Idle,
             &ThreadState::Idle
         ));
-        assert!(crate::observer::applies_state(
-            &ThreadStateFilter::Idle,
-            &ThreadState::Done
-        ));
         assert!(!crate::observer::applies_state(
             &ThreadStateFilter::Idle,
-            &ThreadState::Failed
+            &ThreadState::Unknown
         ));
+    }
+
+    #[test]
+    fn activity_signal_uses_latest_rollout_timestamp_and_evidence_confidence() {
+        let now = at(1_720_000_000);
+        let thread = test_thread();
+        let rollout = RolloutParseResult {
+            latest_activity_at: Some(at(1_719_999_000)),
+            latest_lifecycle_at: Some(at(1_719_999_500)),
+            ..Default::default()
+        };
+        let recent = activity_signal_observation_at(&thread, Some(&rollout), now);
+        assert_eq!(recent.value, Some(ActivitySignal::Recent));
+        assert_eq!(recent.observed_at, Some(at(1_719_999_500)));
+        assert_eq!(recent.confidence, Confidence::Medium);
+
+        let stale_rollout = RolloutParseResult {
+            latest_activity_at: Some(at(1_719_998_000)),
+            ..Default::default()
+        };
+        let stale = activity_signal_observation_at(&thread, Some(&stale_rollout), now);
+        assert_eq!(stale.value, Some(ActivitySignal::Stale));
+        assert_eq!(stale.confidence, Confidence::Medium);
+
+        let mut fallback_thread = test_thread();
+        fallback_thread.updated_at = Some(at(1_719_999_500));
+        let fallback = activity_signal_observation_at(&fallback_thread, None, now);
+        assert_eq!(fallback.value, Some(ActivitySignal::Recent));
+        assert_eq!(fallback.source.unwrap().kind, "threads-table");
+        assert_eq!(fallback.confidence, Confidence::Low);
+
+        let unknown = activity_signal_observation_at(&thread, None, now);
+        assert_eq!(unknown.value, Some(ActivitySignal::Unknown));
+        assert_eq!(unknown.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn state_confidence_is_deterministic_for_fresh_stale_and_missing_evidence() {
+        let now = at(1_720_000_000);
+        assert_eq!(
+            state_confidence_at(&ThreadState::Running, Some(at(1_719_999_500)), now),
+            Confidence::Medium
+        );
+        assert_eq!(
+            state_confidence_at(&ThreadState::Running, Some(at(1_719_998_000)), now),
+            Confidence::Low
+        );
+        assert_eq!(
+            state_confidence_at(&ThreadState::Running, None, now),
+            Confidence::Low
+        );
+        assert_eq!(
+            state_confidence_at(&ThreadState::Unknown, Some(now), now),
+            Confidence::Low
+        );
+    }
+
+    #[test]
+    fn historical_terminal_evidence_keeps_medium_confidence() {
+        let observed_at = at(1_700_000_000);
+        let rollout = RolloutParseResult {
+            last_terminal_event: Some(crate::rollout::RolloutTerminalObservation {
+                event: RolloutTerminalEvent::Failed,
+                observed_at: Some(observed_at),
+            }),
+            ..Default::default()
+        };
+        let observation = last_terminal_event_observation(Some(&rollout));
+        assert_eq!(observation.value, Some(LastTerminalEvent::Failed));
+        assert_eq!(observation.observed_at, Some(observed_at));
+        assert_eq!(observation.confidence, Confidence::Medium);
+    }
+
+    fn minimal_snapshot(id: &str) -> ThreadSnapshot {
+        ThreadSnapshot {
+            thread_id: id.to_string(),
+            nickname: None,
+            role: None,
+            parent_thread_id: None,
+            cwd: None,
+            source_kind: None,
+            children: Vec::new(),
+            project: None,
+            state: ThreadState::Unknown,
+            last_terminal_event: Observed::unknown(),
+            activity_signal: Observed::unknown(),
+            model: ModelSummary {
+                configured: Observed::unknown(),
+                requested: Observed::unknown(),
+                effective: Observed::unknown(),
+                rerouted_from: None,
+                reroute_reason: None,
+            },
+            token_usage: Observed::unknown(),
+            created_at: None,
+            updated_at: None,
+            recency_at: None,
+            rollout_path: None,
+            warnings: Vec::new(),
+            recent_activity: Vec::new(),
+            evidence: ThreadEvidence::default(),
+        }
+    }
+
+    #[test]
+    fn depth_filter_excludes_rows_reaching_a_cycle() {
+        let parent_of = HashMap::from([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+            ("c".to_string(), "a".to_string()),
+        ]);
+        let rows = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(minimal_snapshot)
+            .collect();
+        let filtered = apply_depth_filter(rows, &parent_of, 10);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| row.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d"]
+        );
+    }
+
+    #[test]
+    fn recency_order_is_deterministic_for_equal_and_missing_values() {
+        let now = at(1_720_000_000);
+        assert_eq!(
+            compare_recency_values(Some(now), "b", Some(now), "a"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_recency_values(None, "b", None, "a"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_recency_values(Some(now), "a", None, "z"),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
@@ -1096,6 +1386,10 @@ mod tests {
             warnings: vec![],
             activity: vec![],
             final_state: crate::rollout::RolloutStateHint::Running,
+            last_terminal_event: None,
+            final_state_at: None,
+            latest_lifecycle_at: None,
+            latest_activity_at: None,
             tail_truncated: false,
         };
         let evidence = thread_evidence(
@@ -1155,7 +1449,8 @@ mod tests {
             children: Vec::new(),
             project: None,
             state: ThreadState::Running,
-            state_detail: None,
+            last_terminal_event: Observed::unknown(),
+            activity_signal: Observed::unknown(),
             model: ModelSummary {
                 configured: Observed::unknown(),
                 requested: Observed::unknown(),
@@ -1173,7 +1468,7 @@ mod tests {
             evidence: ThreadEvidence::default(),
         };
         let output = ProbeOutput {
-            schema_version: "codex-agent-monitor.probe.v1".into(),
+            schema_version: "codex-agent-monitor.probe.v2".into(),
             generated_at: Utc::now(),
             codex_home: "home".into(),
             environment: crate::model::ProbeEnvironment {

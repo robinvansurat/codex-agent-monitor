@@ -65,17 +65,22 @@ pub fn build_parent_edges_with_sources(
     let mut parent_sources = HashMap::<String, ParentSource>::new();
     let mut edges = Vec::new();
 
+    let mut explicit_edges = explicit_edges;
+    explicit_edges.sort_unstable_by(|(parent_a, child_a), (parent_b, child_b)| {
+        child_a.cmp(child_b).then_with(|| parent_a.cmp(parent_b))
+    });
     for (parent, child) in explicit_edges {
         if parent == child {
             continue;
         }
-        if explicit_by_child
-            .insert(child.clone(), parent.clone())
-            .is_none()
+        if explicit_by_child.contains_key(&child)
+            || creates_cycle(&child, &parent, &explicit_by_child)
         {
-            edges.push((parent.clone(), child.clone()));
-            parent_sources.insert(child.clone(), ParentSource::ThreadSpawnEdge);
+            continue;
         }
+        explicit_by_child.insert(child.clone(), parent.clone());
+        edges.push((parent.clone(), child.clone()));
+        parent_sources.insert(child.clone(), ParentSource::ThreadSpawnEdge);
     }
 
     let mut source_hints = hints.source_hints.iter().collect::<Vec<_>>();
@@ -118,7 +123,11 @@ pub fn build_thread_tree(thread_ids: &[String], edges: &[(String, String)]) -> V
     let mut parent_of: HashMap<String, String> = HashMap::new();
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
 
-    for (parent, child) in edges {
+    let mut ordered_edges = edges.to_vec();
+    ordered_edges.sort_unstable_by(|(parent_a, child_a), (parent_b, child_b)| {
+        child_a.cmp(child_b).then_with(|| parent_a.cmp(parent_b))
+    });
+    for (parent, child) in &ordered_edges {
         if !ids.contains(parent) || !ids.contains(child) {
             continue;
         }
@@ -159,10 +168,25 @@ pub fn build_thread_tree(thread_ids: &[String], edges: &[(String, String)]) -> V
 }
 
 fn build_node(id: String, children: &HashMap<String, Vec<String>>) -> ThreadTreeNode {
+    build_node_with_visited(id, children, &mut HashSet::new())
+}
+
+fn build_node_with_visited(
+    id: String,
+    children: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+) -> ThreadTreeNode {
+    if !visited.insert(id.clone()) {
+        return ThreadTreeNode {
+            thread_id: id,
+            parent: None,
+            children: Vec::new(),
+        };
+    }
     let nodes = children.get(&id).cloned().unwrap_or_default();
     let child_nodes = nodes
         .into_iter()
-        .map(|child| build_node(child, children))
+        .map(|child| build_node_with_visited(child, children, visited))
         .collect();
     ThreadTreeNode {
         thread_id: id,
@@ -177,8 +201,12 @@ fn creates_cycle(
     parent_of: &HashMap<String, String>,
 ) -> bool {
     let mut current = Some(candidate_parent.to_string());
+    let mut visited = HashSet::new();
     while let Some(current_id) = current {
         if current_id == candidate_child {
+            return true;
+        }
+        if !visited.insert(current_id.clone()) {
             return true;
         }
         current = parent_of.get(&current_id).cloned();
@@ -372,5 +400,33 @@ mod tests {
         let hints = collect_parent_hints(&[child], &rollout_map);
         let edges = build_parent_edges(explicit, &hints);
         assert_eq!(edges, vec![("p1".to_string(), "child".to_string())]);
+    }
+
+    #[test]
+    fn explicit_edges_are_cycle_safe_and_duplicate_children_are_deterministic() {
+        let hints = RawParentHints::new();
+        let edges = build_parent_edges(
+            vec![
+                ("z-parent".into(), "child".into()),
+                ("a-parent".into(), "child".into()),
+                ("child".into(), "z-parent".into()),
+                ("z-parent".into(), "z-parent".into()),
+            ],
+            &hints,
+        );
+        assert_eq!(
+            edges,
+            vec![
+                ("a-parent".to_string(), "child".to_string()),
+                ("child".to_string(), "z-parent".to_string()),
+            ]
+        );
+        assert_eq!(
+            build_parent_edges(
+                vec![("a".into(), "b".into()), ("b".into(), "a".into())],
+                &hints,
+            ),
+            vec![("b".to_string(), "a".to_string())]
+        );
     }
 }

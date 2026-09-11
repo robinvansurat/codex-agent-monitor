@@ -107,14 +107,27 @@ pub struct TokenUsage {
     pub context_window: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThreadState {
     Running,
     Idle,
-    Interrupted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LastTerminalEvent {
+    Completed,
     Failed,
-    Done,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivitySignal {
+    Recent,
+    Stale,
     Unknown,
 }
 
@@ -180,8 +193,8 @@ pub struct ThreadSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     pub state: ThreadState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_detail: Option<String>,
+    pub last_terminal_event: Observed<LastTerminalEvent>,
+    pub activity_signal: Observed<ActivitySignal>,
     pub model: ModelSummary,
     pub token_usage: Observed<TokenUsage>,
     pub created_at: Option<DateTime<Utc>>,

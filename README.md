@@ -58,7 +58,7 @@ Global/command options include:
 
 - `--project <path>`: filter by workspace/root path (matched against persisted `cwd`)
 - `--thread <id>`: exact thread id
-- `--state {running,idle,interrupted,failed,unknown}`
+- `--state {running,idle,unknown}`
 - `--role <name>`
 - `--all` include historical scope; without it default scope is recent (`--recent`, default 1440 min)
 - `--depth <n>`: truncate by ancestor depth
@@ -72,7 +72,7 @@ Global/command options include:
 
 `probe --json` emits:
 
-- `schema_version`
+- `schema_version` (`codex-agent-monitor.probe.v2`)
 - `generated_at`
 - `environment` (`os`, optional detected `codex --version`/path)
 - `query` (normalized query inputs)
@@ -80,6 +80,8 @@ Global/command options include:
 - `warnings`
 - `account_usage`: latest timestamped rollout allowance snapshot with typed `primary` and `secondary` windows (`used_percent`, positive `window_minutes`, optional `resets_at`), plus evidence metadata
 - `recent_activity` per thread (safe event/tool name/status only)
+- `state` is only `running`, `idle`, or `unknown`; the latest terminal result is preserved separately as evidence-aware `last_terminal_event` (`completed`, `failed`, or `interrupted`)
+- `activity_signal` is evidence-aware `recent`, `stale`, or `unknown` using a shared 15-minute freshness window; it never asserts that a thread is running
 - `token_usage` per thread: latest cumulative `token_count` breakdown (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, and optional `context_window`) with evidence metadata; missing or malformed counters remain unknown
 
 Model fields are separated:
@@ -116,9 +118,8 @@ Controls:
 
 Behavior notes:
 
-- Top summary shows counts for `RUNNING`, `IDLE`, `DONE`, and `FAILED`.
-- `DONE` is derived from `Idle` + `turn_completed`; other `Idle` entries remain `IDLE`.
-- `FAILED` reflects only real failed states (no fabricated failures).
+- Top summary shows counts for `RUNNING`, `IDLE`, and `UNKNOWN`.
+- The right pane shows the latest terminal result and activity signal separately from current state.
 - Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, measured token-usage breakdown, and latest safe recent activity entries. Full path and provenance remain in technical details when expanded.
 - The top bar shows `Usage left` from the latest timestamped `rate_limits` observation. Window names come from their observed duration (for example, `Weekly` for 10080 minutes and `5h` for 300 minutes); expired windows stay unavailable until a newer observation arrives.
 
@@ -127,10 +128,11 @@ Behavior notes:
 Persisted observations are best-effort and partial by design:
 
 - task lifecycle from rollout events
-  - `task_complete` with `error:null` => completed turn (`turn_completed`)
-  - `task_complete` with any non-null `error` => `failed`
-  - `turn_aborted` => `interrupted`
-- lock presence in DB indicates writer lock only; not equivalent to active in-memory agent status
+  - `task_complete` with `error:null` => idle plus `last_terminal_event=completed`
+  - `task_complete` with any non-null `error` => idle plus `last_terminal_event=failed`
+  - `task_done` => idle plus `last_terminal_event=completed`
+  - `turn_aborted` => idle plus `last_terminal_event=interrupted`
+- no writer-lock support is inferred from persisted state
 - effective model is not present in persisted rollout or DB output; only supplied runtime stream updates (`model/rerouted`) can expose transient effective model/reroute state
 - runtime `model/rerouted` is transient and not persisted in DB
 - per-task credit consumption is not available from rollout data; `rate_limits.credits` is account-level status, so the monitor does not estimate or display task credits/cost
@@ -141,7 +143,7 @@ Persisted observations are best-effort and partial by design:
 
 Implementation notes are based on local/manual verification (not guaranteed identical for all installs):
 
-- Codex CLI: `0.144.5`
+- Codex CLI: `0.144.5` is the only explicitly validated version; parser shape tolerance is not a version range
 - Windows 11 with Desktop package: `26.810.7004.0`, `app` build `26.810.52044`, build id `6662`
 - research commit reference: `c6058ccaa91ab17159cf805bf4d6d4edd87fe5fc`
 - Desktop-owned stdio app-server had no supported external attach path on Windows in observed environment

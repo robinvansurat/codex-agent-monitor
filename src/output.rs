@@ -1,4 +1,6 @@
-use crate::model::{ModelSpec, Observed, ProbeOutput, TokenUsage};
+use crate::model::{
+    ActivitySignal, LastTerminalEvent, ModelSpec, Observed, ProbeOutput, ThreadState, TokenUsage,
+};
 
 pub fn render_human(summary: &ProbeOutput) -> String {
     let mut out = String::new();
@@ -33,10 +35,10 @@ fn render_node(
         .find(|x| x.thread_id == node.thread_id)
     {
         out.push_str(&format!(
-            "{}- {}  state={:?}  role={}  parent={}\n",
+            "{}- {}  state={}  role={}  parent={}\n",
             prefix,
             t.thread_id,
-            t.state,
+            state_label(&t.state),
             t.role.clone().unwrap_or_else(|| "-".to_string()),
             t.parent_thread_id
                 .clone()
@@ -51,10 +53,22 @@ fn render_node(
             source_label(&t.evidence.role.source),
         ));
         out.push_str(&format!(
-            "{prefix}  state evidence: {:?} ({})\n",
-            t.state,
+            "{prefix}  state evidence: {} ({})\n",
+            state_label(&t.state),
             source_label(&t.evidence.state.source),
         ));
+        out.push_str(&format!(
+            "{prefix}  activity signal: {} ({})\n",
+            activity_signal_label(&t.activity_signal),
+            source_label(&t.activity_signal.source),
+        ));
+        if let Some(event) = t.last_terminal_event.value.as_ref() {
+            out.push_str(&format!(
+                "{prefix}  last terminal event: {} ({})\n",
+                terminal_event_label(event),
+                source_label(&t.last_terminal_event.source),
+            ));
+        }
         out.push_str(&format!(
             "{}  cwd: {} (source={}) source_kind: {} (source={})\n",
             prefix,
@@ -105,7 +119,7 @@ fn render_node(
         }
         if !t.recent_activity.is_empty() {
             out.push_str(&format!("{}  recent activity:\n", prefix));
-            for a in t.recent_activity.iter().take(5) {
+            for a in latest_activity_for_human(&t.recent_activity) {
                 let tool = a.tool_name.clone().unwrap_or_else(|| "-".to_string());
                 let status = a.status.clone().unwrap_or_else(|| "-".to_string());
                 out.push_str(&format!("{}    {} {} {}\n", prefix, a.kind, tool, status));
@@ -122,6 +136,36 @@ fn source_label(source: &Option<crate::model::EvidenceSource>) -> &str {
         .as_ref()
         .map(|x| x.kind.as_str())
         .unwrap_or("unknown")
+}
+
+fn latest_activity_for_human(
+    activities: &[crate::model::ThreadActivity],
+) -> Vec<&crate::model::ThreadActivity> {
+    activities.iter().rev().take(5).rev().collect()
+}
+
+fn state_label(state: &ThreadState) -> &'static str {
+    match state {
+        ThreadState::Running => "RUNNING",
+        ThreadState::Idle => "IDLE",
+        ThreadState::Unknown => "UNKNOWN",
+    }
+}
+
+fn activity_signal_label(signal: &Observed<ActivitySignal>) -> &'static str {
+    match signal.value {
+        Some(ActivitySignal::Recent) => "recent",
+        Some(ActivitySignal::Stale) => "stale",
+        Some(ActivitySignal::Unknown) | None => "unknown",
+    }
+}
+
+fn terminal_event_label(event: &LastTerminalEvent) -> &'static str {
+    match event {
+        LastTerminalEvent::Completed => "completed",
+        LastTerminalEvent::Failed => "failed",
+        LastTerminalEvent::Interrupted => "interrupted",
+    }
 }
 
 fn observed_model_label(value: &Observed<ModelSpec>) -> String {
@@ -182,6 +226,7 @@ fn format_count(value: u64) -> String {
 mod tests {
     use super::*;
     use crate::model::{Confidence, EvidenceSource};
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn human_output_renders_token_usage_breakdown_and_source() {
@@ -221,5 +266,39 @@ mod tests {
         let json = serde_json::to_string(&observed).expect("serialize unknown token usage");
         assert!(json.contains("\"value\":null"));
         assert!(json.contains("\"kind\":\"unknown\""));
+    }
+
+    #[test]
+    fn human_activity_keeps_latest_stream_entries_in_stream_order() {
+        let timestamps = [
+            Some(0),
+            Some(3),
+            Some(2),
+            None,
+            Some(1),
+            Some(7),
+            None,
+            Some(6),
+        ];
+        let activities = timestamps
+            .into_iter()
+            .enumerate()
+            .map(|(index, timestamp)| crate::model::ThreadActivity {
+                kind: format!("event-{index}"),
+                tool_name: None,
+                status: None,
+                timestamp: timestamp
+                    .map(|value| Utc.timestamp_opt(1_720_000_000 + value, 0).unwrap()),
+            })
+            .collect::<Vec<_>>();
+        let latest = latest_activity_for_human(&activities);
+        assert_eq!(latest.len(), 5);
+        assert_eq!(
+            latest
+                .iter()
+                .map(|entry| entry.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event-3", "event-4", "event-5", "event-6", "event-7"]
+        );
     }
 }

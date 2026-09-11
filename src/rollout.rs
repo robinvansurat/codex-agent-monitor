@@ -18,7 +18,24 @@ pub struct RolloutParseResult {
     pub canonical_meta_timestamp: Option<DateTime<Utc>>,
     pub activity: Vec<RolloutActivity>,
     pub final_state: RolloutStateHint,
+    pub last_terminal_event: Option<RolloutTerminalObservation>,
+    pub final_state_at: Option<DateTime<Utc>>,
+    pub latest_lifecycle_at: Option<DateTime<Utc>>,
+    pub latest_activity_at: Option<DateTime<Utc>>,
     pub tail_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutTerminalEvent {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutTerminalObservation {
+    pub event: RolloutTerminalEvent,
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,6 +237,7 @@ fn process_record(value: &Value, thread_id: &str, result: &mut RolloutParseResul
 
     if !is_older_copy {
         if let Some(activity) = build_activity(event_type.clone(), payload, record_timestamp) {
+            update_latest_timestamp(&mut result.latest_activity_at, activity.ts);
             result.activity.push(activity);
         }
     }
@@ -228,33 +246,65 @@ fn process_record(value: &Value, thread_id: &str, result: &mut RolloutParseResul
         match event_type.as_deref() {
             Some("task_started") | Some("turn_started") => {
                 result.final_state = RolloutStateHint::Running;
+                result.final_state_at = record_timestamp;
+                update_latest_timestamp(&mut result.latest_lifecycle_at, record_timestamp);
             }
             Some("turn_aborted") => {
                 result.final_state = RolloutStateHint::Interrupted;
+                result.final_state_at = record_timestamp;
+                result.last_terminal_event = Some(RolloutTerminalObservation {
+                    event: RolloutTerminalEvent::Interrupted,
+                    observed_at: record_timestamp,
+                });
+                update_latest_timestamp(&mut result.latest_lifecycle_at, record_timestamp);
             }
             Some("task_complete") => {
                 let is_failed = payload
                     .as_ref()
-                    .and_then(|p| p.get("error"))
+                    .and_then(|p| {
+                        p.get("error")
+                            .or_else(|| p.get("payload").and_then(|nested| nested.get("error")))
+                    })
                     .is_some_and(|error| !error.is_null());
                 if is_failed {
                     result.final_state = RolloutStateHint::Failed;
+                    result.last_terminal_event = Some(RolloutTerminalObservation {
+                        event: RolloutTerminalEvent::Failed,
+                        observed_at: record_timestamp,
+                    });
                 } else {
                     result.final_state = RolloutStateHint::TurnCompleted;
+                    result.last_terminal_event = Some(RolloutTerminalObservation {
+                        event: RolloutTerminalEvent::Completed,
+                        observed_at: record_timestamp,
+                    });
                 }
+                result.final_state_at = record_timestamp;
+                update_latest_timestamp(&mut result.latest_lifecycle_at, record_timestamp);
             }
             Some("task_done") => {
                 result.final_state = RolloutStateHint::TurnCompleted;
+                result.final_state_at = record_timestamp;
+                result.last_terminal_event = Some(RolloutTerminalObservation {
+                    event: RolloutTerminalEvent::Completed,
+                    observed_at: record_timestamp,
+                });
+                update_latest_timestamp(&mut result.latest_lifecycle_at, record_timestamp);
             }
-            Some("agent_idle") | Some("idle")
-                if matches!(
-                    result.final_state,
-                    RolloutStateHint::Unknown | RolloutStateHint::Failed
-                ) =>
-            {
+            Some("agent_idle") | Some("idle") => {
                 result.final_state = RolloutStateHint::Idle;
+                result.final_state_at = record_timestamp;
+                update_latest_timestamp(&mut result.latest_lifecycle_at, record_timestamp);
             }
             _ => {}
+        }
+    }
+}
+
+fn update_latest_timestamp(slot: &mut Option<DateTime<Utc>>, candidate: Option<DateTime<Utc>>) {
+    if let Some(candidate) = candidate {
+        if slot.is_none_or(|existing| candidate > existing) {
+            *slot = Some(candidate);
         }
     }
 }
@@ -762,6 +812,7 @@ fn lookup_ci_object<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::path::Path;
 
     #[test]
@@ -769,6 +820,13 @@ mod tests {
         let path = Path::new("tests/fixtures/rollout/sample.jsonl");
         let result = parse_rollout_file(path, "thread-root", false);
         assert_eq!(result.final_state, RolloutStateHint::TurnCompleted);
+        assert_eq!(
+            result.last_terminal_event,
+            Some(RolloutTerminalObservation {
+                event: RolloutTerminalEvent::Completed,
+                observed_at: Some(Utc.timestamp_opt(1_720_000_001, 0).unwrap()),
+            })
+        );
         assert_eq!(
             result.requested_model,
             Some(RolloutModelObservation {
@@ -780,6 +838,23 @@ mod tests {
         );
         assert_eq!(result.canonical_parent.as_deref(), Some("parent-ignored"));
         assert_eq!(result.canonical_nickname, None);
+    }
+
+    #[test]
+    fn idle_event_ends_running_state_and_stream_order_controls_final_state_time() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary rollout");
+        writeln!(file, r#"{{"timestamp":1720000200,"type":"task_started"}}"#).expect("write start");
+        writeln!(file, r#"{{"timestamp":1720000100,"type":"agent_idle"}}"#).expect("write idle");
+        let result = parse_rollout_file(file.path(), "thread", false);
+        assert_eq!(result.final_state, RolloutStateHint::Idle);
+        assert_eq!(
+            result.final_state_at,
+            Some(Utc.timestamp_opt(1_720_000_100, 0).unwrap())
+        );
+        assert_eq!(
+            result.latest_lifecycle_at,
+            Some(Utc.timestamp_opt(1_720_000_200, 0).unwrap())
+        );
     }
 
     #[test]
