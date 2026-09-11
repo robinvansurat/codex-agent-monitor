@@ -417,7 +417,7 @@ fn render_header(
     }
 
     let title = Line::from(Span::styled(
-        "Codex Agent Monitor",
+        format!("Codex Agent Monitor v{}", env!("CARGO_PKG_VERSION")),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -2067,6 +2067,7 @@ mod tests {
             detail: None,
         };
 
+        let expected_title = format!("Codex Agent Monitor v{}", env!("CARGO_PKG_VERSION"));
         for width in [120, 100, 80, 60] {
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -2104,7 +2105,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            assert!(rendered.contains("Codex Agent Monitor"), "width {width}");
+            assert!(rendered.contains(&expected_title), "width {width}");
             assert!(rendered.contains("Usage left:"), "width {width}");
             assert!(rendered.contains("Weekly 56%"), "width {width}");
             assert!(rendered.contains("5h 75%"), "width {width}");
