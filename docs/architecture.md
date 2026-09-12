@@ -4,6 +4,7 @@
 
 - `cli`: argument parsing (`clap`) and command normalization (`probe`/`watch`/`tui`)
 - `config`: resolve `CODEX_HOME`, `sqlite_home`, and read config files
+- `kiro`: read-only ingestion for native CLI, ACP worker, and legacy SQLite sessions
 - `db`: read-only SQLite ingestion with schema/table introspection
 - `rollout`: stream parser for thread JSONL files
 - `runtime`: optional one-shot runtime event overlay (`model/rerouted`)
@@ -16,6 +17,9 @@
 - `state_5.sqlite` (required base of truth for thread list, timestamps, agent metadata, rollout file paths, parent edges)
 - rollout JSONL files referenced by thread rows (`rollout_path`)
 - optional runtime overlay source (`--runtime-events`)
+- Kiro session files and the legacy Kiro conversation database when `--provider`
+  is `kiro` or `all`
+- optional native Kiro account lookup through `kiro-cli acp` for plan credits
 
 No writes are made to Codex files, DB, or runtime processes.
 
@@ -106,6 +110,15 @@ metadata boundary are ignored using the same stale-record guard as other rollout
 facts. Account-level `rate_limits.credits` is not per-task consumption, so no task
 credit or cost estimate is produced.
 
+Kiro native session metadata is deliberately not coerced into this cumulative
+model. Credit-denominated `metering_usage` is ignored for token accounting, and
+all-zero native token counters remain unknown. When both a validated current
+context percentage (`0..=100`) and positive model context window are persisted,
+the observer emits a separate `ThreadSnapshot.context_usage` value. Its
+`used_tokens_approx` is `round(percentage × window)` and is always labeled as
+current, approximate context occupancy—not cumulative use, billing, or credits.
+Malformed or incomplete pairs remain unknown.
+
 ## Watch model
 
 Long-running refresh in `watch` is implemented as efficient polling with rollout cache:
@@ -132,3 +145,36 @@ Long-running refresh in `watch` is implemented as efficient polling with rollout
 
 Only Codex CLI `0.144.5` is explicitly validated. Parser shape tolerance is
 intentional compatibility handling, not a supported version range.
+
+## Kiro ingestion
+
+Kiro native CLI sessions are read from `sessions/cli/<id>.json` and their
+adjacent JSONL telemetry; ACP workers are read from the bounded
+`sessions/<workspace>/sess_<id>/` layout. Legacy conversations are read from
+`data.sqlite3` in read-only mode. Directory traversal is bounded to those
+known layouts and symlinks are skipped. Kiro records use namespaced IDs
+(`kiro:<native-id>`), are independent roots, and retain only safe telemetry.
+Native session files win when the same native ID is also present in legacy
+SQLite. Native CLI task files are read only from
+`sessions/cli/<id>/tasks/<numeric-id>.json`; snapshots retain only numeric IDs
+and normalized lifecycle statuses, never task subjects or descriptions. When no
+valid native task files exist, the task observation has no value and carries a
+safe availability detail; the monitor never synthesizes task entries.
+`AssistantMessage`/`ToolResults` envelopes are reduced to tool names and result
+statuses while tool IDs, purposes, inputs, and outputs are discarded. JSONL
+stream order is preserved because native tool records may omit timestamps.
+For native CLI sessions, a prompt newer than the latest terminal record is
+classified as `running` only when the adjacent JSON lock contains a valid PID
+for a live process. The same live lock without a pending prompt does not imply
+work; missing, malformed, or stale lock evidence keeps a pending turn
+`unknown`. Completed turns remain `idle`. Kiro lifecycle evidence is timestamp
+ordered where timestamps exist, and incomplete or unsupported records remain
+unknown with a warning.
+
+Kiro account credits are a separate observed field. When enabled, the monitor
+spawns `kiro-cli acp --agent-engine v3 --auth-method cli` in a neutral temporary
+directory, sends `initialize`, waits for its response, then sends
+`_kiro/account/getUsage`. It does not create a session, load a workspace, or
+execute callbacks. Probe performs a bounded initial wait; watch and TUI refresh
+in the background and cache successful results for five minutes. Explicit
+`--kiro-home` data directories stay offline unless `--kiro-cli` is supplied.

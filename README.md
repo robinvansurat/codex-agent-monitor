@@ -1,6 +1,6 @@
 # codex-agent-monitor
 
-`codex-agent-monitor` is an open-source read-only local monitor for Codex persisted state.
+`codex-agent-monitor` is an open-source read-only local monitor for Codex and Kiro persisted state.
 
 ## What it is / is not
 
@@ -22,10 +22,13 @@ It is **not**:
 - Build deterministic parent/child thread hierarchy with explicit `thread_spawn_edges` precedence
 - Parse rollout JSONL safely (tolerant of malformed lines, canonical thread identity checks, missing files)
 - Expose evidence-aware snapshots and provenance (`source`, `confidence`, `observed_at`, `detail`)
-- Expose the latest cumulative per-task token usage observation from rollout `token_count` events
+- Expose the latest cumulative per-task token usage observation from Codex rollout `token_count` events
+- Expose Kiro native current-context occupancy from persisted percentage/window evidence, clearly labeled as approximate and non-cumulative
 - Show the latest account usage allowance observed in monitored rollout `rate_limits` events
 - Optional TUI for navigation and thread details
 - Optional `--runtime-events` overlay (`model/rerouted`) for ephemeral effective model/reroute facts
+- Kiro CLI and ACP session inspection with `--provider kiro` or `--provider all`
+- Kiro native task progress (numeric task IDs and normalized statuses only) plus safe native tool call/result activity
 
 ## Install/build
 
@@ -56,6 +59,12 @@ Commands:
 
 Global/command options include:
 
+- `--provider {codex,kiro,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode)
+- `--kiro-home <path>` (or `KIRO_HOME`): Kiro home to inspect; defaults to `~/.kiro`
+- `--kiro-db <path>`: explicit legacy Kiro SQLite database override
+- `--kiro-cli <path>`: explicit `kiro-cli` executable for the authenticated Kiro credit lookup
+- `--no-kiro-usage`: skip the native authenticated Kiro credit lookup
+
 - `--project <path>`: filter by workspace/root path (matched against persisted `cwd`)
 - `--thread <id>`: exact thread id
 - `--state {running,idle,unknown}`
@@ -80,6 +89,8 @@ Global/command options include:
 - `warnings`
 - `account_usage`: latest timestamped rollout allowance snapshot with typed `primary` and `secondary` windows (`used_percent`, positive `window_minutes`, optional `resets_at`), plus evidence metadata
 - `recent_activity` per thread (safe event/tool name/status only)
+- `task_progress`: numeric IDs and normalized `pending`/`in_progress`/`completed`/`unknown` statuses when valid Kiro native task files exist; otherwise Kiro rows can carry a safe availability explanation without task text
+- `context_usage` when valid Kiro native evidence exists: current `used_percent`, `context_window_tokens`, and `used_tokens_approx` derived from those two persisted values; this is current context occupancy, not cumulative or billed token usage
 - `state` is only `running`, `idle`, or `unknown`; the latest terminal result is preserved separately as evidence-aware `last_terminal_event` (`completed`, `failed`, or `interrupted`)
 - `activity_signal` is evidence-aware `recent`, `stale`, or `unknown` using a shared 15-minute freshness window; it never asserts that a thread is running
 - `token_usage` per thread: latest cumulative `token_count` breakdown (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, and optional `context_window`) with evidence metadata; missing or malformed counters remain unknown
@@ -103,13 +114,57 @@ Rollout parsing stores only non-sensitive telemetry fields:
 
 Message text, instructions, tool input/output, summaries, and results are intentionally not retained in memory or JSON output.
 
+Kiro support follows the same policy. Native task files are read only from the
+session's adjacent `tasks` directory; the monitor retains numeric task IDs and
+normalized statuses, but never task subjects or descriptions. Native tool events
+retain only the tool name and result status, never tool IDs, purposes, inputs, or
+outputs. Native CLI files under `sessions/cli`, ACP
+worker files under `sessions/<workspace>/sess_*/`, and the legacy
+`data.sqlite3` conversation tables are read locally and read-only. Kiro IDs are
+shown as `kiro:<native-id>`; `--thread` also accepts the raw native ID. Native
+session files take precedence over duplicate legacy SQLite rows. Kiro model
+and effort fields are requested-session observations; configured/effective
+models, cumulative tokens, and parent relationships remain unknown because the
+local Kiro formats do not provide reliable evidence for them. Native sessions
+may separately expose current context occupancy from Kiro's persisted percentage
+and model context window. The displayed token count is explicitly approximate
+(`percentage × window`) and is never presented as cumulative usage, billing, or
+credits. Kiro lifecycle
+state is conservative: a timestamped pending native prompt is `running` only
+while its adjacent session lock names a live process; a completed turn is
+`idle`, and missing, malformed, or stale lock evidence leaves a pending turn
+`unknown`. Activity timestamps do not by themselves imply that a session is
+running.
+
+When `--provider kiro` or `--provider all` uses the normal Kiro home, the
+monitor can make one read-only native ACP request to
+`_kiro/account/getUsage` and report observed plan credits, reset date, and
+valid bonus/add-on balances. The request uses Kiro's own stored login and does
+not create a session or read project content. Use `--no-kiro-usage` for an
+offline-only run. When `--kiro-home`/`KIRO_HOME` points at an explicit data
+directory, account lookup stays disabled unless `--kiro-cli` is also supplied.
+
+For Kiro session persistence and commands, see the
+[Kiro session management guide](https://kiro.dev/docs/cli/chat/session-management/).
+The internal JSON and SQLite shapes were verified against local Kiro 2.21.x
+files (including 2.21.2 and 2.21.3) and may evolve with future Kiro releases.
+
+Examples:
+
+```text
+codex-agent-monitor --provider kiro probe
+codex-agent-monitor --provider all --project /work/my-repo probe --json
+codex-agent-monitor --provider kiro --kiro-home /tmp/kiro tui
+codex-agent-monitor --provider kiro --no-kiro-usage probe
+```
+
 ## TUI
 
 Controls:
 
 - `j`/`k` or `↑`/`↓` move selection
 - `f` toggles the local state filter between `All` and `Running`; `Running` is ordered newest-first by latest known activity
-- `/` enters search mode for name / ID / role / nickname / cwd / model / effort
+- `/` enters search mode for provider (`codex`/`kiro`), name / ID / role / nickname / cwd / model / effort
 - `Enter` toggles recent activity expansion
 - `i` toggles technical details
 - `r` or `F5` forces an immediate snapshot refresh
@@ -120,8 +175,9 @@ Behavior notes:
 
 - Top summary shows counts for `RUNNING`, `IDLE`, and `UNKNOWN`.
 - The right pane shows the latest terminal result and activity signal separately from current state.
-- Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, measured token-usage breakdown, and latest safe recent activity entries. Full path and provenance remain in technical details when expanded.
-- The top bar shows `Usage left` from the latest timestamped `rate_limits` observation. Window names come from their observed duration (for example, `Weekly` for 10080 minutes and `5h` for 300 minutes); expired windows stay unavailable until a newer observation arrives.
+- The `Running` filter intentionally hides idle and unknown sessions after a turn ends; switch to `All` to keep their cards visible.
+- Right pane is read-only and shows selected agent name, humanized state, age, current activity, preferred model/effort, cumulative token-usage breakdown when available, current Kiro context occupancy when available, latest safe recent activity entries, and Kiro task IDs/statuses. Kiro cards show `Ctx ~<tokens>` and, when present, completed/total task progress; details explicitly say when Kiro did not persist a task plan. Full path and provenance remain in technical details when expanded.
+- The top bar separates `Codex usage` from `Kiro credits`. Codex windows come from the latest timestamped `rate_limits` observation; Kiro credits come from the native authenticated lookup when enabled. Unknown, loading, and stale values remain explicit.
 
 ## Privacy and limits
 
@@ -132,10 +188,11 @@ Persisted observations are best-effort and partial by design:
   - `task_complete` with any non-null `error` => idle plus `last_terminal_event=failed`
   - `task_done` => idle plus `last_terminal_event=completed`
   - `turn_aborted` => idle plus `last_terminal_event=interrupted`
-- no writer-lock support is inferred from persisted state
+- no Codex writer-lock support is inferred from persisted state
 - effective model is not present in persisted rollout or DB output; only supplied runtime stream updates (`model/rerouted`) can expose transient effective model/reroute state
 - runtime `model/rerouted` is transient and not persisted in DB
 - per-task credit consumption is not available from rollout data; `rate_limits.credits` is account-level status, so the monitor does not estimate or display task credits/cost
+- Kiro native `metering_usage` records are credit-denominated in the validated format and are never mapped to tokens; all-zero native token-counter records remain unknown rather than being reported as zero usage
 - account usage is derived only from already parsed monitored rollouts. CLI project/thread/role/recent filters bound the evidence that can contribute to the snapshot; state/depth and local TUI search/filtering only change the displayed rows after the account snapshot is assembled.
 - canonical thread-parent inference uses **thread id equality**, not copied historical metadata
 

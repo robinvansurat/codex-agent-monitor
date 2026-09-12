@@ -79,6 +79,40 @@ pub struct AccountUsage {
     pub secondary: Option<AccountUsageWindow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KiroCreditBalance {
+    pub used: f64,
+    pub total: f64,
+    pub remaining: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KiroBonusCredit {
+    pub name: Option<String>,
+    pub used: f64,
+    pub total: f64,
+    pub remaining: f64,
+    pub days_until_expiry: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KiroAddOnCredit {
+    pub used: f64,
+    pub total: f64,
+    pub remaining: f64,
+    pub expires_at: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct KiroAccountUsage {
+    pub plan_name: Option<String>,
+    pub billing_cycle_reset: Option<String>,
+    pub plan_credits: Option<KiroCreditBalance>,
+    pub bonus_credits: Vec<KiroBonusCredit>,
+    pub add_on_credits: Vec<KiroAddOnCredit>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub model: Option<String>,
@@ -105,6 +139,13 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextUsage {
+    pub used_percent: f64,
+    pub used_tokens_approx: u64,
+    pub context_window_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +180,60 @@ pub struct ThreadActivity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     pub timestamp: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Unknown,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadTask {
+    pub id: u64,
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskProgress {
+    pub tasks: Vec<ThreadTask>,
+}
+
+impl TaskProgress {
+    pub fn completed_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Completed)
+            .count()
+    }
+
+    pub fn in_progress_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::InProgress)
+            .count()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Pending)
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +292,10 @@ pub struct ThreadSnapshot {
     pub activity_signal: Observed<ActivitySignal>,
     pub model: ModelSummary,
     pub token_usage: Observed<TokenUsage>,
+    #[serde(default, skip_serializing_if = "is_unknown_observed")]
+    pub context_usage: Observed<ContextUsage>,
+    #[serde(default, skip_serializing_if = "is_unknown_observed")]
+    pub task_progress: Observed<TaskProgress>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub recency_at: Option<DateTime<Utc>>,
@@ -227,6 +326,8 @@ pub struct ProbeOutput {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub account_usage: Observed<AccountUsage>,
+    #[serde(default)]
+    pub kiro_account_usage: Observed<KiroAccountUsage>,
     pub threads: Vec<ThreadSnapshot>,
     pub tree: Vec<ThreadTreeNode>,
 }
@@ -242,6 +343,8 @@ pub struct ProbeEnvironment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryInfo {
+    #[serde(default)]
+    pub provider: Option<String>,
     pub include_all: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -259,4 +362,8 @@ fn is_none_observed<T>(value: &Option<Observed<T>>) -> bool {
         .as_ref()
         .map(|x| x.value.is_none() && x.detail.as_deref() == Some("No local evidence"))
         .unwrap_or(true)
+}
+
+fn is_unknown_observed<T>(value: &Observed<T>) -> bool {
+    value.value.is_none() && value.detail.as_deref() == Some("No local evidence")
 }

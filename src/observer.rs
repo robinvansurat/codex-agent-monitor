@@ -1,30 +1,190 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::process::Command;
 
-use crate::cli::{FilterOpts, ThreadStateFilter};
+use crate::cli::{FilterOpts, Provider, ThreadStateFilter};
 use crate::config::{
     load_agent_config_value, load_config, resolve_codex_home, sqlite_home, SqliteHome,
 };
 use crate::db::DbThreadRecord;
+use crate::kiro::{self, KiroThreadRecord};
+use crate::kiro_usage::{self, UsageClient};
 use crate::model::{
-    AccountUsage, AccountUsageWindow, ActivitySignal, Confidence, EvidenceSource,
-    LastTerminalEvent, ModelSpec, ModelSummary, Observed, ProbeEnvironment, ProbeOutput, QueryInfo,
-    ThreadActivity, ThreadEvidence, ThreadSnapshot, ThreadState, TokenUsage,
+    AccountUsage, AccountUsageWindow, ActivitySignal, Confidence, ContextUsage, EvidenceSource,
+    KiroAccountUsage, LastTerminalEvent, ModelSpec, ModelSummary, Observed, ProbeEnvironment,
+    ProbeOutput, QueryInfo, TaskProgress, ThreadActivity, ThreadEvidence, ThreadSnapshot,
+    ThreadState, TokenUsage,
 };
-use crate::rollout::{RolloutParseResult, RolloutStateHint, RolloutTerminalEvent};
+use crate::rollout::{
+    RolloutParseResult, RolloutStateHint, RolloutTerminalEvent, RolloutTerminalObservation,
+};
 use crate::runtime::RuntimeOverlay;
 
 #[derive(Debug)]
 pub struct Monitor {
     pub codex_home: PathBuf,
+    pub kiro_home: PathBuf,
+    pub kiro_db: Option<PathBuf>,
+    kiro_home_explicit: bool,
+    pub provider: Provider,
     pub config: crate::config::ConfigContext,
     environment: ProbeEnvironment,
     rollout_cache: HashMap<PathBuf, CachedRollout>,
+    startup_warnings: Vec<String>,
+    kiro_usage: KiroUsageState,
+}
+
+#[derive(Debug)]
+struct KiroUsageState {
+    client: UsageClient,
+    enabled: bool,
+    started_at: Option<Instant>,
+    receiver: Option<Receiver<Result<Observed<KiroAccountUsage>, String>>>,
+    cancel: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+    value: Observed<KiroAccountUsage>,
+    last_success: Option<Observed<KiroAccountUsage>>,
+    diagnostic: Option<String>,
+}
+
+impl KiroUsageState {
+    fn new(client: UsageClient, enabled: bool, disabled_reason: Option<String>) -> Self {
+        let enabled = enabled && client.is_available();
+        let value = if enabled {
+            kiro_usage::unknown("Loading native Kiro account credits")
+        } else if let Some(reason) = disabled_reason.as_deref() {
+            kiro_usage::unknown(reason)
+        } else if client.is_available() {
+            kiro_usage::unknown("Kiro account lookup disabled")
+        } else {
+            kiro_usage::unknown("Kiro CLI unavailable")
+        };
+        Self {
+            client,
+            enabled,
+            started_at: None,
+            receiver: None,
+            cancel: None,
+            worker: None,
+            value,
+            last_success: None,
+            diagnostic: None,
+        }
+    }
+
+    fn refresh(&mut self, wait: bool) -> (Observed<KiroAccountUsage>, Option<String>) {
+        self.poll();
+        let due = self
+            .started_at
+            .is_none_or(|started| started.elapsed() >= kiro_usage::REFRESH_INTERVAL);
+        if self.enabled && self.receiver.is_none() && due {
+            self.started_at = Some(Instant::now());
+            if let Some((receiver, cancel, worker)) = self.client.spawn() {
+                self.receiver = Some(receiver);
+                self.cancel = Some(cancel);
+                self.worker = Some(worker);
+            }
+            if wait {
+                let wait_result = self
+                    .receiver
+                    .as_ref()
+                    .map(|receiver| receiver.recv_timeout(kiro_usage::REQUEST_TIMEOUT));
+                if let Some(wait_result) = wait_result {
+                    match wait_result {
+                        Ok(result) => {
+                            self.receiver = None;
+                            self.cancel = None;
+                            self.join_worker();
+                            self.apply(result);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            self.value = self
+                                .last_success
+                                .clone()
+                                .map(|mut value| {
+                                    value.confidence = Confidence::Low;
+                                    value.detail = Some(
+                                        "stale while Kiro lookup is still loading".to_string(),
+                                    );
+                                    value
+                                })
+                                .unwrap_or_else(|| {
+                                    kiro_usage::unknown("Kiro account lookup is still loading")
+                                });
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            self.apply(Err("native lookup unavailable".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        (self.value.clone(), self.diagnostic.take())
+    }
+
+    fn poll(&mut self) {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.receiver = None;
+                self.cancel = None;
+                self.join_worker();
+                self.apply(result);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                self.cancel = None;
+                self.join_worker();
+                self.apply(Err("native lookup unavailable".to_string()));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn apply(&mut self, result: Result<Observed<KiroAccountUsage>, String>) {
+        match result {
+            Ok(value) => {
+                self.last_success = Some(value.clone());
+                self.value = value;
+            }
+            Err(error) => {
+                self.value = self
+                    .last_success
+                    .clone()
+                    .map(|mut value| {
+                        value.confidence = Confidence::Low;
+                        value.detail = Some(format!("stale: {error}"));
+                        value
+                    })
+                    .unwrap_or_else(|| kiro_usage::unknown(error.clone()));
+                self.diagnostic = Some(format!("Kiro account usage unavailable: {error}"));
+            }
+        }
+    }
+
+    fn join_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for KiroUsageState {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.join_worker();
+    }
 }
 
 pub const FRESHNESS_WINDOW_MINUTES: i64 = 15;
@@ -38,13 +198,83 @@ struct CachedRollout {
 
 impl Monitor {
     pub fn new(override_home: Option<String>) -> Result<Self> {
+        Self::new_with_sources(override_home, None, None, Provider::Codex)
+    }
+
+    pub fn new_with_sources(
+        override_home: Option<String>,
+        kiro_home: Option<String>,
+        kiro_db: Option<String>,
+        provider: Provider,
+    ) -> Result<Self> {
+        Self::new_with_sources_and_usage(override_home, kiro_home, kiro_db, provider, None, true)
+    }
+
+    pub fn new_with_sources_and_usage(
+        override_home: Option<String>,
+        kiro_home: Option<String>,
+        kiro_db: Option<String>,
+        provider: Provider,
+        kiro_cli: Option<String>,
+        no_kiro_usage: bool,
+    ) -> Result<Self> {
         let home = resolve_codex_home(override_home.as_deref())?;
-        let config = load_config(&home)?;
+        let (resolved_kiro_home, kiro_home_explicit) =
+            kiro::resolve_kiro_home(kiro_home.as_deref())?;
+        let mut startup_warnings = Vec::new();
+        let config = if matches!(provider, Provider::Kiro) {
+            crate::config::ConfigContext {
+                global: None,
+                agents_dir: None,
+                home: home.clone(),
+            }
+        } else {
+            match load_config(&home) {
+                Ok(config) => config,
+                Err(err) if matches!(provider, Provider::All) => {
+                    startup_warnings.push(format!("Codex config unavailable: {err}"));
+                    crate::config::ConfigContext {
+                        global: None,
+                        agents_dir: None,
+                        home: home.clone(),
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let kiro_db = kiro_db.map(PathBuf::from).or_else(|| {
+            if kiro_home_explicit {
+                Some(resolved_kiro_home.join("data.sqlite3"))
+            } else {
+                None
+            }
+        });
+        let usage_requested = matches!(provider, Provider::Kiro | Provider::All);
+        let usage_enabled =
+            usage_requested && !no_kiro_usage && (!kiro_home_explicit || kiro_cli.is_some());
+        let usage_client = if usage_enabled {
+            UsageClient::new(kiro_usage::discover_executable(kiro_cli.as_deref()))
+        } else {
+            UsageClient::new(None)
+        };
+        let disabled_reason = if no_kiro_usage && usage_requested {
+            Some("Kiro account lookup disabled by --no-kiro-usage".to_string())
+        } else if usage_requested && kiro_home_explicit && kiro_cli.is_none() {
+            Some("Kiro account lookup disabled for explicit Kiro home".to_string())
+        } else {
+            None
+        };
         Ok(Monitor {
             codex_home: home,
+            kiro_home: resolved_kiro_home,
+            kiro_db,
+            kiro_home_explicit,
+            provider: provider.clone(),
             config,
-            environment: detect_environment(),
+            environment: detect_environment(!matches!(provider, Provider::Kiro)),
             rollout_cache: HashMap::new(),
+            startup_warnings,
+            kiro_usage: KiroUsageState::new(usage_client, usage_enabled, disabled_reason),
         })
     }
 
@@ -54,18 +284,124 @@ impl Monitor {
         runtime: RuntimeOverlay,
         allow_partial_rollout: bool,
     ) -> Result<ProbeOutput> {
-        let sqlite_root = sqlite_home(&self.codex_home, &self.config);
-        let db_path = match sqlite_root {
-            SqliteHome::Directory(dir) => dir.join("state_5.sqlite"),
-            SqliteHome::File(file) => file,
-        };
+        self.probe_snapshot_internal(filters, runtime, allow_partial_rollout, false)
+    }
 
-        let db = crate::db::read_state_db(&db_path)?;
-        let mut warnings = db.warnings;
+    pub fn probe_snapshot_with_usage_wait(
+        &mut self,
+        filters: &FilterOpts,
+        runtime: RuntimeOverlay,
+        allow_partial_rollout: bool,
+    ) -> Result<ProbeOutput> {
+        self.probe_snapshot_internal(filters, runtime, allow_partial_rollout, true)
+    }
+
+    fn probe_snapshot_internal(
+        &mut self,
+        filters: &FilterOpts,
+        runtime: RuntimeOverlay,
+        allow_partial_rollout: bool,
+        wait_for_kiro_usage: bool,
+    ) -> Result<ProbeOutput> {
+        let mut db_threads = Vec::new();
+        let mut parent_edges = Vec::new();
+        let mut warnings = self.startup_warnings.clone();
+        if matches!(self.provider, Provider::Codex | Provider::All) {
+            let sqlite_root = sqlite_home(&self.codex_home, &self.config);
+            let db_path = match sqlite_root {
+                SqliteHome::Directory(dir) => dir.join("state_5.sqlite"),
+                SqliteHome::File(file) => file,
+            };
+            match crate::db::read_state_db(&db_path) {
+                Ok(db) => {
+                    warnings.extend(db.warnings);
+                    parent_edges = db.parent_edges;
+                    db_threads = db.threads;
+                }
+                Err(err) if matches!(self.provider, Provider::All) => {
+                    warnings.push(format!("Codex state unavailable: {err}"));
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let mut rollouts: HashMap<String, RolloutParseResult> = HashMap::new();
+        let mut kiro_paths = HashMap::<String, PathBuf>::new();
+        let mut kiro_context_usage = HashMap::<String, Observed<ContextUsage>>::new();
+        let mut kiro_task_progress = HashMap::<String, Observed<TaskProgress>>::new();
+        if matches!(self.provider, Provider::Kiro | Provider::All) {
+            let kiro_snapshot = kiro::read_snapshot(
+                &self.kiro_home,
+                self.kiro_db.as_deref(),
+                self.kiro_home_explicit,
+            );
+            warnings.extend(kiro_snapshot.warnings);
+            for kiro_thread in kiro_snapshot.threads {
+                let id = kiro_thread.id.clone();
+                if db_threads.iter().any(|thread| thread.id == id) {
+                    continue;
+                }
+                kiro_paths.extend(kiro_thread.path.clone().map(|path| (id.clone(), path)));
+                if let Some(context_usage) = kiro_thread.context_usage.clone() {
+                    kiro_context_usage.insert(
+                        id.clone(),
+                        Observed {
+                            value: Some(context_usage),
+                            source: Some(EvidenceSource {
+                                kind: "kiro.session.context_usage".to_string(),
+                                detail: Some(
+                                    "persisted current-context percentage and model window"
+                                        .to_string(),
+                                ),
+                            }),
+                            observed_at: kiro_thread.context_usage_at,
+                            confidence: Confidence::Medium,
+                            detail: Some(
+                                "current context occupancy; approximate tokens are derived from the persisted percentage and window, not cumulative token usage"
+                                    .to_string(),
+                            ),
+                        },
+                    );
+                }
+                if kiro_thread.task_progress.is_some() || kiro_thread.task_progress_detail.is_some()
+                {
+                    let has_progress = kiro_thread.task_progress.is_some();
+                    kiro_task_progress.insert(
+                        id.clone(),
+                        Observed {
+                            value: kiro_thread.task_progress.clone(),
+                            source: Some(EvidenceSource {
+                                kind: "kiro.tasks".to_string(),
+                                detail: Some(
+                                    if has_progress {
+                                        "native Kiro task store"
+                                    } else {
+                                        "Kiro task-plan availability"
+                                    }
+                                    .to_string(),
+                                ),
+                            }),
+                            observed_at: kiro_thread.task_progress_at,
+                            confidence: if has_progress {
+                                Confidence::Medium
+                            } else {
+                                Confidence::Low
+                            },
+                            detail: kiro_thread.task_progress_detail.clone().or_else(|| {
+                                Some(
+                                    "numeric task ids and statuses only; task text excluded"
+                                        .to_string(),
+                                )
+                            }),
+                        },
+                    );
+                }
+                rollouts.insert(id.clone(), kiro_rollout(&kiro_thread));
+                db_threads.push(kiro_db_record(&kiro_thread));
+            }
+        }
+        let all_threads = db_threads;
 
-        let candidate_threads: Vec<&crate::db::DbThreadRecord> = db
-            .threads
+        let candidate_threads: Vec<&crate::db::DbThreadRecord> = all_threads
             .iter()
             .filter(|thread| {
                 if let Some(project_filter) = &filters.project {
@@ -102,14 +438,13 @@ impl Monitor {
                 filters
                     .thread
                     .as_ref()
-                    .is_none_or(|needle| thread.id == *needle)
+                    .is_none_or(|needle| thread_id_matches(&thread.id, needle))
             })
             .map(|thread| thread.id.clone())
             .collect();
 
         for thread_id in &selected_ids {
-            if let Some(thread) = db
-                .threads
+            if let Some(thread) = all_threads
                 .iter()
                 .find(|t| &t.id == thread_id)
                 .and_then(|t| t.rollout_path.as_ref())
@@ -126,9 +461,9 @@ impl Monitor {
             }
         }
 
-        let hints = crate::tree::collect_parent_hints(&db.threads, &rollouts);
+        let hints = crate::tree::collect_parent_hints(&all_threads, &rollouts);
         let (edges, parent_sources) =
-            crate::tree::build_parent_edges_with_sources(db.parent_edges.clone(), &hints);
+            crate::tree::build_parent_edges_with_sources(parent_edges, &hints);
         let mut parent_of = HashMap::new();
         for (parent, child) in &edges {
             parent_of.insert(child.clone(), parent.clone());
@@ -151,16 +486,22 @@ impl Monitor {
                 continue;
             }
             if let Some(thread_filter) = &filters.thread {
-                if &thread.id != thread_filter {
+                if !thread_id_matches(&thread.id, thread_filter) {
                     continue;
                 }
             }
 
             let requested = requested_model(thread, rollouts.get(&thread.id));
             let configured = configured_model(thread, &self.config);
+            let is_kiro = thread
+                .source_kind
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("kiro_"));
             let mut effective = Observed::unknown();
-            if let Some(value) = runtime.effective_model.get(&thread.id) {
-                effective = value.clone();
+            if !is_kiro {
+                if let Some(value) = runtime.effective_model.get(&thread.id) {
+                    effective = value.clone();
+                }
             }
             let mut activity = Vec::new();
             if let Some(parsed) = parsed_rollout {
@@ -177,7 +518,8 @@ impl Monitor {
             }
 
             let thread_state = state;
-            let last_terminal_event = last_terminal_event_observation(parsed_rollout);
+            let last_terminal_event =
+                last_terminal_event_observation(parsed_rollout, thread.source_kind.as_deref());
             let activity_signal = activity_signal_observation(thread, parsed_rollout);
 
             let mut children = Vec::new();
@@ -222,17 +564,34 @@ impl Monitor {
                     configured,
                     requested,
                     effective,
-                    rerouted_from: runtime.rerouted_from.get(&thread.id).cloned(),
-                    reroute_reason: runtime.reroute_reason.get(&thread.id).cloned(),
+                    rerouted_from: if is_kiro {
+                        None
+                    } else {
+                        runtime.rerouted_from.get(&thread.id).cloned()
+                    },
+                    reroute_reason: if is_kiro {
+                        None
+                    } else {
+                        runtime.reroute_reason.get(&thread.id).cloned()
+                    },
                 },
                 token_usage: token_usage_observation(rollouts.get(&thread.id)),
+                context_usage: kiro_context_usage
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_else(Observed::unknown),
+                task_progress: kiro_task_progress
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_else(Observed::unknown),
                 created_at: thread.created_at,
                 updated_at: thread.updated_at,
                 recency_at: thread.recency_at,
                 rollout_path: thread
                     .rollout_path
                     .as_ref()
-                    .map(|p| p.display().to_string()),
+                    .map(|p| p.display().to_string())
+                    .or_else(|| kiro_paths.get(&thread.id).map(|p| p.display().to_string())),
                 warnings: Vec::new(),
                 recent_activity: activity,
                 evidence,
@@ -259,10 +618,14 @@ impl Monitor {
         let tree = crate::tree::build_thread_tree(&ids, &out_edges);
 
         let account_usage = account_usage_observation(&rollouts);
+        let (kiro_account_usage, kiro_usage_warning) = self.kiro_usage.refresh(wait_for_kiro_usage);
 
         let mut combined_warnings = Vec::new();
         combined_warnings.extend(warnings);
         combined_warnings.extend(runtime.warnings);
+        if let Some(warning) = kiro_usage_warning {
+            combined_warnings.push(warning);
+        }
         Ok(ProbeOutput {
             schema_version: "codex-agent-monitor.probe.v2".to_string(),
             generated_at: Utc::now(),
@@ -278,13 +641,82 @@ impl Monitor {
                     .map(|s| format!("{:?}", s).to_lowercase()),
                 role: filters.role.clone(),
                 depth: filters.depth,
+                provider: Some(
+                    match self.provider {
+                        Provider::Codex => "codex",
+                        Provider::Kiro => "kiro",
+                        Provider::All => "all",
+                    }
+                    .to_string(),
+                ),
             },
             warnings: combined_warnings,
             account_usage,
+            kiro_account_usage,
             threads: thread_rows,
             tree,
         })
     }
+}
+
+fn kiro_db_record(thread: &KiroThreadRecord) -> crate::db::DbThreadRecord {
+    crate::db::DbThreadRecord {
+        id: thread.id.clone(),
+        rollout_path: None,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+        recency_at: thread.recency_at,
+        source: None,
+        thread_source: None,
+        model: None,
+        reasoning_effort: None,
+        agent_nickname: thread.nickname.clone(),
+        agent_role: thread.role.clone(),
+        agent_path: None,
+        cwd: thread.cwd.clone(),
+        source_kind: Some(thread.source_kind.clone()),
+        raw: HashMap::new(),
+    }
+}
+
+fn kiro_rollout(thread: &KiroThreadRecord) -> RolloutParseResult {
+    let final_state = match thread.state {
+        ThreadState::Running => RolloutStateHint::Running,
+        ThreadState::Idle => match thread.terminal.as_ref().map(|(event, _)| event) {
+            Some(RolloutTerminalEvent::Failed) => RolloutStateHint::Failed,
+            Some(RolloutTerminalEvent::Interrupted) => RolloutStateHint::Interrupted,
+            _ => RolloutStateHint::TurnCompleted,
+        },
+        ThreadState::Unknown => RolloutStateHint::Unknown,
+    };
+    let terminal = thread
+        .terminal
+        .map(|(event, observed_at)| RolloutTerminalObservation { event, observed_at });
+    let latest_activity_at = thread.activity.iter().filter_map(|item| item.ts).max();
+    RolloutParseResult {
+        warnings: thread.warnings.clone(),
+        requested_model: if thread.model.is_some() || thread.effort.is_some() {
+            Some(crate::rollout::RolloutModelObservation {
+                model: thread.model.clone(),
+                effort: thread.effort.clone(),
+                source: format!("{}.session", thread.source_kind),
+                observed_at: thread.updated_at,
+            })
+        } else {
+            None
+        },
+        activity: thread.activity.clone(),
+        final_state,
+        last_terminal_event: terminal,
+        final_state_at: thread.lifecycle_at,
+        latest_lifecycle_at: thread.lifecycle_at,
+        latest_activity_at,
+        ..RolloutParseResult::default()
+    }
+}
+
+fn thread_id_matches(id: &str, filter: &str) -> bool {
+    id == filter || id.strip_prefix("kiro:").is_some_and(|raw| raw == filter)
 }
 
 fn account_usage_observation(
@@ -449,11 +881,15 @@ fn normalize_path(path: &Path) -> String {
     }
 }
 
-fn detect_environment() -> ProbeEnvironment {
+fn detect_environment(include_codex: bool) -> ProbeEnvironment {
     let os = std::env::consts::OS.to_string();
     let mut codex_cli_path = None;
     let mut codex_cli_version = None;
-    for path in find_command_in_path("codex") {
+    for path in include_codex
+        .then(|| find_command_in_path("codex"))
+        .into_iter()
+        .flatten()
+    {
         if let Ok(output) = Command::new(&path).arg("--version").output() {
             if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout);
@@ -621,6 +1057,7 @@ fn state_confidence_at(
 
 fn last_terminal_event_observation(
     rollout: Option<&RolloutParseResult>,
+    source_kind: Option<&str>,
 ) -> Observed<LastTerminalEvent> {
     let Some(rollout) = rollout else {
         return Observed::unknown();
@@ -637,7 +1074,12 @@ fn last_terminal_event_observation(
     Observed {
         value: Some(value),
         source: Some(EvidenceSource {
-            kind: "rollout.lifecycle".to_string(),
+            kind: if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
+                "kiro.lifecycle"
+            } else {
+                "rollout.lifecycle"
+            }
+            .to_string(),
             detail: Some("latest terminal lifecycle event".to_string()),
         }),
         observed_at,
@@ -658,12 +1100,21 @@ fn activity_signal_observation_at(
     rollout: Option<&RolloutParseResult>,
     now: DateTime<Utc>,
 ) -> Observed<ActivitySignal> {
+    let is_kiro = thread
+        .source_kind
+        .as_deref()
+        .is_some_and(|kind| kind.starts_with("kiro_"));
     let rollout_timestamp = rollout.and_then(|value| {
         [value.latest_activity_at, value.latest_lifecycle_at]
             .into_iter()
             .flatten()
             .max()
     });
+    let fallback_source = if is_kiro {
+        "kiro.persisted-state"
+    } else {
+        "threads-table"
+    };
     let (timestamp, source) = rollout_timestamp
         .map(|value| (Some(value), "rollout.activity"))
         .unwrap_or_else(|| {
@@ -672,7 +1123,7 @@ fn activity_signal_observation_at(
                     .recency_at
                     .or(thread.updated_at)
                     .or(thread.created_at),
-                "threads-table",
+                fallback_source,
             )
         });
     let Some(timestamp) = timestamp else {
@@ -680,7 +1131,7 @@ fn activity_signal_observation_at(
             value: Some(ActivitySignal::Unknown),
             source: Some(EvidenceSource {
                 kind: "unknown".to_string(),
-                detail: Some("no rollout or database activity timestamp".to_string()),
+                detail: Some("no persisted activity timestamp".to_string()),
             }),
             observed_at: None,
             confidence: Confidence::Low,
@@ -688,6 +1139,11 @@ fn activity_signal_observation_at(
         };
     };
     let recent = timestamp >= now - ChronoDuration::minutes(FRESHNESS_WINDOW_MINUTES);
+    let source = if is_kiro && source == "rollout.activity" {
+        "kiro.activity"
+    } else {
+        source
+    };
     Observed {
         value: Some(if recent {
             ActivitySignal::Recent
@@ -696,10 +1152,17 @@ fn activity_signal_observation_at(
         }),
         source: Some(EvidenceSource {
             kind: source.to_string(),
-            detail: Some("latest available activity timestamp".to_string()),
+            detail: Some(
+                if source == "kiro.persisted-state" {
+                    "latest Kiro session or task-store timestamp"
+                } else {
+                    "latest available activity timestamp"
+                }
+                .to_string(),
+            ),
         }),
         observed_at: Some(timestamp),
-        confidence: if source == "threads-table" {
+        confidence: if matches!(source, "threads-table" | "kiro.persisted-state") {
             Confidence::Low
         } else {
             Confidence::Medium
@@ -742,6 +1205,15 @@ fn thread_evidence(
     });
     let cwd = thread.cwd.clone();
     let source_kind = thread.source_kind.clone();
+    let kiro_source = thread
+        .source_kind
+        .as_deref()
+        .is_some_and(|kind| kind.starts_with("kiro_"));
+    let session_source = if kiro_source {
+        "kiro.session"
+    } else {
+        "persisted-session"
+    };
 
     let latest_activity = activity.last().cloned().map(|activity| {
         let confidence = if activity.timestamp.is_some() {
@@ -752,7 +1224,7 @@ fn thread_evidence(
         Observed {
             value: Some(activity),
             source: Some(EvidenceSource {
-                kind: "persisted-session".to_string(),
+                kind: session_source.to_string(),
                 detail: Some("latest activity".to_string()),
             }),
             observed_at: None,
@@ -766,12 +1238,16 @@ fn thread_evidence(
             .map(|value| {
                 Observed::from_value(
                     Some(value),
-                    if thread.agent_nickname.is_some() {
+                    if kiro_source {
+                        "kiro.session"
+                    } else if thread.agent_nickname.is_some() {
                         "threads-table"
                     } else {
                         "persisted-session-meta"
                     },
-                    Some(if thread.agent_nickname.is_some() {
+                    Some(if kiro_source {
+                        "from Kiro session".to_string()
+                    } else if thread.agent_nickname.is_some() {
                         "from threads table".to_string()
                     } else {
                         "from persisted-session meta".to_string()
@@ -784,12 +1260,16 @@ fn thread_evidence(
             .map(|value| {
                 Observed::from_value(
                     Some(value),
-                    if thread.agent_role.is_some() {
+                    if kiro_source {
+                        "kiro.session"
+                    } else if thread.agent_role.is_some() {
                         "threads-table"
                     } else {
                         "persisted-session-meta"
                     },
-                    Some(if thread.agent_role.is_some() {
+                    Some(if kiro_source {
+                        "from Kiro session".to_string()
+                    } else if thread.agent_role.is_some() {
                         "from threads table".to_string()
                     } else {
                         "from persisted-session meta".to_string()
@@ -811,8 +1291,12 @@ fn thread_evidence(
         state: Observed {
             value: Some(state),
             source: Some(EvidenceSource {
-                kind: "persisted-session".to_string(),
-                detail: Some("derived from rollout lifecycle".to_string()),
+                kind: session_source.to_string(),
+                detail: Some(if kiro_source {
+                    "derived from Kiro lifecycle".to_string()
+                } else {
+                    "derived from rollout lifecycle".to_string()
+                }),
             }),
             observed_at: None,
             confidence: if state_is_unknown {
@@ -826,8 +1310,16 @@ fn thread_evidence(
             .map(|value| {
                 Observed::from_value(
                     Some(value),
-                    "threads-table",
-                    Some("from threads table".to_string()),
+                    if kiro_source {
+                        "kiro.session"
+                    } else {
+                        "threads-table"
+                    },
+                    Some(if kiro_source {
+                        "from Kiro session".to_string()
+                    } else {
+                        "from threads table".to_string()
+                    }),
                     None,
                 )
             })
@@ -836,8 +1328,16 @@ fn thread_evidence(
             .map(|value| {
                 Observed::from_value(
                     Some(value),
-                    "threads-table",
-                    Some("from threads table".to_string()),
+                    if kiro_source {
+                        "kiro.session"
+                    } else {
+                        "threads-table"
+                    },
+                    Some(if kiro_source {
+                        "from Kiro session".to_string()
+                    } else {
+                        "from threads table".to_string()
+                    }),
                     None,
                 )
             })
@@ -850,6 +1350,22 @@ fn configured_model(
     thread: &crate::db::DbThreadRecord,
     cfg: &crate::config::ConfigContext,
 ) -> Observed<ModelSpec> {
+    if thread
+        .source_kind
+        .as_deref()
+        .is_some_and(|kind| kind.starts_with("kiro_"))
+    {
+        return Observed {
+            value: None,
+            source: Some(EvidenceSource {
+                kind: "kiro.session".to_string(),
+                detail: Some("Kiro configured model is not available".to_string()),
+            }),
+            observed_at: None,
+            confidence: Confidence::Low,
+            detail: Some("configured model unknown".to_string()),
+        };
+    }
     let mut model = cfg.global.as_ref().and_then(|g| g.model.clone());
     let mut effort = cfg
         .global
@@ -1104,7 +1620,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let observation = last_terminal_event_observation(Some(&rollout));
+        let observation = last_terminal_event_observation(Some(&rollout), None);
         assert_eq!(observation.value, Some(LastTerminalEvent::Failed));
         assert_eq!(observation.observed_at, Some(observed_at));
         assert_eq!(observation.confidence, Confidence::Medium);
@@ -1131,6 +1647,8 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: Observed::unknown(),
+            context_usage: Observed::unknown(),
+            task_progress: Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,
@@ -1459,6 +1977,8 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: Observed::unknown(),
+            context_usage: Observed::unknown(),
+            task_progress: Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,
@@ -1477,6 +1997,7 @@ mod tests {
                 codex_cli_version: None,
             },
             query: crate::model::QueryInfo {
+                provider: None,
                 include_all: false,
                 project: None,
                 thread: None,
@@ -1486,6 +2007,7 @@ mod tests {
             },
             warnings: vec![],
             account_usage: Observed::unknown(),
+            kiro_account_usage: Observed::unknown(),
             threads: vec![snapshot],
             tree: Vec::new(),
         };

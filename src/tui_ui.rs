@@ -21,14 +21,16 @@ use ratatui::{
 
 use crate::cli::FilterOpts;
 use crate::model::{
-    AccountUsage, AccountUsageWindow, ActivitySignal, LastTerminalEvent, Observed, ThreadSnapshot,
-    ThreadState, ThreadTreeNode, TokenUsage,
+    AccountUsage, AccountUsageWindow, ActivitySignal, ContextUsage, KiroAccountUsage,
+    LastTerminalEvent, Observed, TaskProgress, ThreadSnapshot, ThreadState, ThreadTreeNode,
+    TokenUsage,
 };
 use crate::observer::Monitor;
 use crate::runtime::RuntimeOverlay;
 
 const REFRESH_INTERVAL_MS: u64 = 1000;
 const HISTORY_LIMIT: usize = 10;
+const TASK_DETAIL_LIMIT: usize = 5;
 const SHORT_ID_LEN: usize = 8;
 const AGENT_CARD_LINES: usize = 6;
 
@@ -105,7 +107,11 @@ struct ListRow {
     model: String,
     effort: String,
     token_total: String,
+    context_usage: Option<String>,
+    task_progress: Option<String>,
     origin_label: String,
+    source_kind: String,
+    provider_label: String,
     state_label: String,
     state_bucket: StateBucket,
     age_label: String,
@@ -196,6 +202,8 @@ pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
                     selected_snapshot,
                     counts: &counts,
                     account_usage: &active_snapshot.account_usage,
+                    kiro_account_usage: &active_snapshot.kiro_account_usage,
+                    provider: active_snapshot.query.provider.as_deref().unwrap_or("codex"),
                     selected: state.selected,
                     state_filter: &state.state_filter,
                     last_refresh_label: status_span.as_str(),
@@ -321,6 +329,8 @@ struct TuiViewState<'a> {
     selected_snapshot: Option<&'a ThreadSnapshot>,
     counts: &'a StateCounts,
     account_usage: &'a Observed<AccountUsage>,
+    kiro_account_usage: &'a Observed<KiroAccountUsage>,
+    provider: &'a str,
     selected: usize,
     state_filter: &'a LocalStateFilter,
     last_refresh_label: &'a str,
@@ -333,7 +343,7 @@ struct TuiViewState<'a> {
 
 fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_>) {
     let is_wide = size.width >= 100;
-    let header_height = if is_wide { 4 } else { 7 };
+    let header_height = if is_wide { 5 } else { 7 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -350,6 +360,8 @@ fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_
         outer[0],
         render_state.counts,
         render_state.account_usage,
+        render_state.kiro_account_usage,
+        render_state.provider,
         render_state.last_refresh_label,
         is_wide,
     );
@@ -401,11 +413,14 @@ fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_
     frame.render_widget(footer, outer[2]);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_header(
     frame: &mut Frame,
     area: Rect,
     counts: &StateCounts,
     account_usage: &Observed<AccountUsage>,
+    kiro_account_usage: &Observed<KiroAccountUsage>,
+    provider: &str,
     last_refresh: &str,
     is_wide: bool,
 ) {
@@ -417,7 +432,11 @@ fn render_header(
     }
 
     let title = Line::from(Span::styled(
-        format!("Codex Agent Monitor v{}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "{} v{}",
+            provider_title(provider),
+            env!("CARGO_PKG_VERSION")
+        ),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -439,7 +458,11 @@ fn render_header(
         ));
         let header_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(inner);
         let row = Layout::default()
             .direction(Direction::Horizontal)
@@ -452,10 +475,10 @@ fn render_header(
         frame.render_widget(Paragraph::new(title), row[0]);
         frame.render_widget(Paragraph::new(status_line), row[1]);
         frame.render_widget(Paragraph::new(refresh).alignment(Alignment::Right), row[2]);
-        frame.render_widget(
-            Paragraph::new(account_usage_line(account_usage, Utc::now())),
-            header_rows[1],
-        );
+        let usage = usage_lines(provider, account_usage, kiro_account_usage, Utc::now());
+        for (index, line) in usage.into_iter().take(2).enumerate() {
+            frame.render_widget(Paragraph::new(line), header_rows[1 + index]);
+        }
         return;
     }
 
@@ -464,28 +487,57 @@ fn render_header(
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(inner);
     frame.render_widget(Paragraph::new(title), header_rows[0]);
     frame.render_widget(Paragraph::new(status_line), header_rows[1]);
-    frame.render_widget(
-        Paragraph::new(account_usage_line(account_usage, Utc::now())).wrap(Wrap { trim: false }),
-        header_rows[2],
-    );
+    let usage = usage_lines(provider, account_usage, kiro_account_usage, Utc::now());
+    for (index, line) in usage.into_iter().take(2).enumerate() {
+        frame.render_widget(Paragraph::new(line), header_rows[2 + index]);
+    }
     frame.render_widget(
         Paragraph::new(format!(
             "Updated: {}  •  Auto-refresh {}ms",
             last_refresh, REFRESH_INTERVAL_MS
         )),
-        header_rows[3],
+        header_rows[4],
     );
 }
 
-fn account_usage_line(account_usage: &Observed<AccountUsage>, now: DateTime<Utc>) -> String {
+fn provider_title(provider: &str) -> &'static str {
+    match provider {
+        "kiro" => "Kiro Agent Monitor",
+        "all" => "Codex + Kiro Monitor",
+        _ => "Codex Agent Monitor",
+    }
+}
+
+fn usage_lines(
+    provider: &str,
+    account_usage: &Observed<AccountUsage>,
+    kiro_account_usage: &Observed<KiroAccountUsage>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if matches!(provider, "codex" | "all") {
+        lines.push(account_usage_line("Codex usage", account_usage, now));
+    }
+    if matches!(provider, "kiro" | "all") {
+        lines.push(kiro_account_usage_line(kiro_account_usage, now));
+    }
+    lines
+}
+
+fn account_usage_line(
+    label: &str,
+    account_usage: &Observed<AccountUsage>,
+    now: DateTime<Utc>,
+) -> String {
     let Some(usage) = account_usage.value.as_ref() else {
-        return "Usage left: unavailable".to_string();
+        return format!("{label}: unavailable");
     };
 
     let mut windows = Vec::new();
@@ -496,18 +548,64 @@ fn account_usage_line(account_usage: &Observed<AccountUsage>, now: DateTime<Utc>
         windows.push(account_usage_window_label(window, now));
     }
     if windows.is_empty() {
-        return "Usage left: unavailable".to_string();
+        return format!("{label}: unavailable");
     }
 
     let observed = account_usage
         .observed_at
         .map(|timestamp| format_time_delta(Some(timestamp), now))
         .unwrap_or_else(|| "unknown age".to_string());
-    format!(
-        "Usage left: {}  •  observed {}",
-        windows.join(" · "),
-        observed
-    )
+    format!("{label}: {}  •  observed {}", windows.join(" · "), observed)
+}
+
+fn kiro_account_usage_line(usage: &Observed<KiroAccountUsage>, now: DateTime<Utc>) -> String {
+    let Some(value) = usage.value.as_ref() else {
+        return format!(
+            "Kiro credits: {}",
+            usage.detail.as_deref().unwrap_or("unavailable")
+        );
+    };
+    let Some(plan) = value.plan_credits.as_ref() else {
+        return "Kiro credits: unavailable".to_string();
+    };
+    let stale = if usage.confidence == crate::model::Confidence::Low {
+        "(stale) "
+    } else {
+        ""
+    };
+    let mut line = format!(
+        "Kiro credits: {stale}{:.2} left / {:.2} plan credits",
+        plan.remaining, plan.total
+    );
+    if let Some(reset) = value.billing_cycle_reset.as_deref() {
+        line.push_str(&format!("  •  reset {reset}"));
+    }
+    for bonus in &value.bonus_credits {
+        let Some(days) = bonus.days_until_expiry else {
+            continue;
+        };
+        let expiry = if days == 0 {
+            "expires today".to_string()
+        } else {
+            format!("expires in {days}d")
+        };
+        line.push_str(&format!(
+            "  •  bonus {}: {:.2} left ({expiry})",
+            bonus.name.as_deref().unwrap_or("credits"),
+            bonus.remaining
+        ));
+    }
+    for add_on in &value.add_on_credits {
+        if add_on.is_active == Some(true) {
+            line.push_str(&format!("  •  add-on: {:.2} left", add_on.remaining));
+        }
+    }
+    let observed = usage
+        .observed_at
+        .map(|timestamp| format_time_delta(Some(timestamp), now))
+        .unwrap_or_else(|| "unknown age".to_string());
+    line.push_str(&format!("  •  observed {observed}"));
+    line
 }
 
 fn account_usage_window_label(window: &AccountUsageWindow, now: DateTime<Utc>) -> String {
@@ -687,6 +785,16 @@ fn render_agent_card(frame: &mut Frame, area: Rect, row: &ListRow, is_selected: 
         Span::styled(prefix, Style::default().fg(Color::DarkGray)),
         Span::styled("● ", state_style),
         Span::styled(
+            format!("[{}] ", row.provider_label),
+            Style::default()
+                .fg(if row.provider_label == "Kiro" {
+                    Color::Magenta
+                } else {
+                    Color::Blue
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
             row.display_name.clone(),
             Style::default()
                 .fg(Color::White)
@@ -700,16 +808,31 @@ fn render_agent_card(frame: &mut Frame, area: Rect, row: &ListRow, is_selected: 
         Span::raw(format!(" • {}", row.age_label)),
     ]));
 
+    let mut summary_metrics = Vec::new();
+    if let Some(task_progress) = row.task_progress.as_deref() {
+        summary_metrics.push(task_progress);
+    }
+    if let Some(context_usage) = row.context_usage.as_deref() {
+        summary_metrics.push(context_usage);
+    }
+    if summary_metrics.is_empty() {
+        summary_metrics.push(row.token_total.as_str());
+    }
+    let summary_metric = summary_metrics.join(" • ");
     lines.push(Line::from(vec![
         Span::styled(
             format!("{} • {} • ", row.model, row.effort),
             Style::default(),
         ),
-        Span::styled(row.token_total.clone(), Style::default().fg(Color::Yellow)),
+        Span::styled(summary_metric, Style::default().fg(Color::Yellow)),
     ]));
 
     lines.push(Line::from(Span::styled(
-        row.origin_label.clone(),
+        if row.source_kind.is_empty() {
+            row.origin_label.clone()
+        } else {
+            format!("{} • {}", row.source_kind, row.origin_label)
+        },
         Style::default(),
     )));
 
@@ -770,6 +893,13 @@ fn render_details_pane(
         display_name(selected),
         Style::default().add_modifier(Modifier::BOLD),
     )]));
+    if let Some(source_kind) = selected.source_kind.as_deref() {
+        lines.push(Line::from(format!(
+            "Provider: {}  •  Source: {}",
+            provider_for_source_kind(Some(source_kind)),
+            friendly_source_kind(source_kind),
+        )));
+    }
     lines.push(Line::from(vec![
         Span::styled(
             state_text,
@@ -788,6 +918,47 @@ fn render_details_pane(
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(current_activity_line(selected)));
+    if let Some(progress) = selected.task_progress.value.as_ref() {
+        lines.push(horizontal_divider(inner.width));
+        lines.push(Line::from(Span::styled(
+            "Task progress",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(task_progress_detail_label(progress)));
+        if progress.tasks.is_empty() {
+            lines.push(Line::from("No persisted tasks"));
+        } else {
+            for task in progress.tasks.iter().take(TASK_DETAIL_LIMIT) {
+                lines.push(Line::from(format!(
+                    "  #{} {}",
+                    task.id,
+                    task.status.as_str()
+                )));
+            }
+            if progress.tasks.len() > TASK_DETAIL_LIMIT {
+                lines.push(Line::from(format!(
+                    "  +{} more",
+                    progress.tasks.len() - TASK_DETAIL_LIMIT
+                )));
+            }
+        }
+    } else if let Some(detail) = selected
+        .task_progress
+        .detail
+        .as_deref()
+        .filter(|detail| *detail != "No local evidence")
+    {
+        lines.push(horizontal_divider(inner.width));
+        lines.push(Line::from(Span::styled(
+            "Task progress",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!("Unavailable: {detail}")));
+    }
     lines.push(horizontal_divider(inner.width));
     if let Some(event) = selected.last_terminal_event.value.as_ref() {
         lines.push(Line::from(format!(
@@ -848,6 +1019,18 @@ fn render_details_pane(
     lines.push(Line::from(format_token_usage_details(
         &selected.token_usage,
     )));
+    if selected.context_usage.value.is_some() {
+        lines.push(horizontal_divider(inner.width));
+        lines.push(Line::from(Span::styled(
+            "Context usage",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format_context_usage_details(
+            &selected.context_usage,
+        )));
+    }
 
     lines.push(horizontal_divider(inner.width));
     lines.push(Line::from(Span::styled(
@@ -1042,7 +1225,11 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
         model,
         effort,
         token_total: token_total_label(&thread.token_usage),
+        context_usage: context_usage_card_label(&thread.context_usage),
+        task_progress: task_progress_card_label(&thread.task_progress),
         origin_label,
+        source_kind: thread.source_kind.clone().unwrap_or_default(),
+        provider_label: provider_for_source_kind(thread.source_kind.as_deref()),
         state_label,
         state_bucket: bucket,
         age_label,
@@ -1061,6 +1248,40 @@ fn token_total_label(observed: &Observed<TokenUsage>) -> String {
         .map(format_compact_count)
         .unwrap_or_else(|| "?".to_string());
     format!("Tokens {total}")
+}
+
+fn context_usage_card_label(observed: &Observed<ContextUsage>) -> Option<String> {
+    observed
+        .value
+        .as_ref()
+        .map(|usage| format!("Ctx ~{}", format_compact_count(usage.used_tokens_approx)))
+}
+
+fn task_progress_card_label(observed: &Observed<TaskProgress>) -> Option<String> {
+    observed.value.as_ref().map(|progress| {
+        format!(
+            "Tasks {}/{}",
+            progress.completed_count(),
+            progress.tasks.len()
+        )
+    })
+}
+
+fn task_progress_detail_label(progress: &TaskProgress) -> String {
+    let unknown = progress.tasks.len().saturating_sub(
+        progress.completed_count() + progress.in_progress_count() + progress.pending_count(),
+    );
+    let mut label = format!(
+        "{}/{} completed • {} active • {} pending",
+        progress.completed_count(),
+        progress.tasks.len(),
+        progress.in_progress_count(),
+        progress.pending_count(),
+    );
+    if unknown > 0 {
+        label.push_str(&format!(" • {unknown} unknown"));
+    }
+    label
 }
 
 fn format_token_usage_details(observed: &Observed<TokenUsage>) -> String {
@@ -1083,7 +1304,20 @@ fn format_token_usage_details(observed: &Observed<TokenUsage>) -> String {
     )
 }
 
-fn source_label(observed: &Observed<TokenUsage>) -> &str {
+fn format_context_usage_details(observed: &Observed<ContextUsage>) -> String {
+    let Some(usage) = observed.value.as_ref() else {
+        return format!("unavailable (source={})", source_label(observed));
+    };
+    format!(
+        "{:.1}% used  •  approximately {} / {} tokens  •  current, not cumulative  (source={})",
+        usage.used_percent,
+        format_count(usage.used_tokens_approx),
+        format_count(usage.context_window_tokens),
+        source_label(observed),
+    )
+}
+
+fn source_label<T>(observed: &Observed<T>) -> &str {
     observed
         .source
         .as_ref()
@@ -1135,7 +1369,7 @@ fn matches_filter_query(row: &ListRow, query: &str) -> bool {
         return true;
     }
     let haystack = format!(
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {}",
         row.display_name,
         row.short_id,
         row.thread_id,
@@ -1143,10 +1377,27 @@ fn matches_filter_query(row: &ListRow, query: &str) -> bool {
         row.nickname,
         row.cwd,
         row.model,
-        row.effort
+        row.effort,
+        row.provider_label
     )
     .to_ascii_lowercase();
     haystack.contains(&q)
+}
+
+fn provider_for_source_kind(source_kind: Option<&str>) -> String {
+    if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
+        "Kiro".to_string()
+    } else {
+        "Codex".to_string()
+    }
+}
+
+fn friendly_source_kind(source_kind: &str) -> &str {
+    match source_kind {
+        "kiro_cli" => "Kiro CLI",
+        "kiro_acp" => "Kiro ACP worker",
+        _ => "Codex",
+    }
 }
 
 fn visible_rows_for_filter(
@@ -1254,12 +1505,19 @@ fn display_name(snapshot: &ThreadSnapshot) -> String {
     {
         return snapshot.nickname.clone().unwrap_or_default();
     }
-    if snapshot
+    if let Some(role) = snapshot
         .role
         .as_deref()
-        .is_some_and(|role| !role.trim().is_empty())
+        .filter(|role| !role.trim().is_empty())
     {
-        return snapshot.role.clone().unwrap_or_default();
+        let generic_kiro_role = snapshot
+            .source_kind
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with("kiro_"))
+            && matches!(role, "default" | "kiro_default");
+        if !generic_kiro_role {
+            return role.to_string();
+        }
     }
     if snapshot.parent_thread_id.is_some() {
         format!("Worker {}", short_id(&snapshot.thread_id))
@@ -1273,7 +1531,10 @@ fn origin_label(cwd: Option<&str>) -> (String, String) {
         return ("From: unknown".to_string(), "unknown".to_string());
     };
     let path = Path::new(&cwd);
-    for ancestor in path.ancestors() {
+    for ancestor in path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
         let git_file = ancestor.join(".git");
         if git_file.is_dir() || git_file.is_file() {
             let repo_name = ancestor
@@ -1366,8 +1627,8 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use crate::model::{
-        AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, LastTerminalEvent, ModelSpec,
-        TokenUsage,
+        AccountUsage, AccountUsageWindow, Confidence, EvidenceSource, KiroAccountUsage,
+        KiroCreditBalance, LastTerminalEvent, ModelSpec, TokenUsage,
     };
     use chrono::Duration;
     use chrono::Utc;
@@ -1379,7 +1640,7 @@ mod tests {
     use super::*;
 
     #[allow(clippy::too_many_arguments)]
-    fn make_snapshot(
+    pub(super) fn make_snapshot(
         thread_id: &str,
         nickname: Option<&str>,
         role: Option<&str>,
@@ -1438,6 +1699,8 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: crate::model::Observed::unknown(),
+            context_usage: crate::model::Observed::unknown(),
+            task_progress: crate::model::Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,
@@ -1661,6 +1924,8 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: crate::model::Observed::unknown(),
+            context_usage: crate::model::Observed::unknown(),
+            task_progress: crate::model::Observed::unknown(),
             created_at: None,
             updated_at: None,
             recency_at: None,
@@ -1821,6 +2086,8 @@ mod tests {
                             unknown: 0,
                         },
                         account_usage: &Observed::unknown(),
+                        kiro_account_usage: &Observed::unknown(),
+                        provider: "codex",
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
                         last_refresh_label: "just now",
@@ -1936,7 +2203,7 @@ mod tests {
             .iter()
             .find(|line| line.contains(&display))
             .expect("selected card title line present");
-        assert!(card_title_line.contains(&format!("   ● {}", display)));
+        assert!(card_title_line.contains(&format!("   ● [Codex] {}", display)));
 
         let buffer = terminal.backend().buffer();
         let has_cyan_border = buffer.content().iter().enumerate().any(|(idx, cell)| {
@@ -2009,6 +2276,8 @@ mod tests {
                             unknown: 0,
                         },
                         account_usage: &Observed::unknown(),
+                        kiro_account_usage: &Observed::unknown(),
+                        provider: "codex",
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
                         last_refresh_label: "just now",
@@ -2086,6 +2355,8 @@ mod tests {
                                 unknown: 7,
                             },
                             account_usage: &account_usage,
+                            kiro_account_usage: &Observed::unknown(),
+                            provider: "codex",
                             selected: 0,
                             state_filter: &LocalStateFilter::All,
                             last_refresh_label: "just now",
@@ -2106,7 +2377,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(rendered.contains(&expected_title), "width {width}");
-            assert!(rendered.contains("Usage left:"), "width {width}");
+            assert!(rendered.contains("Codex usage:"), "width {width}");
             assert!(rendered.contains("Weekly 56%"), "width {width}");
             assert!(rendered.contains("5h 75%"), "width {width}");
             assert!(rendered.contains("observed just now"), "width {width}");
@@ -2138,7 +2409,7 @@ mod tests {
             confidence: Confidence::High,
             detail: None,
         };
-        let line = account_usage_line(&usage, now);
+        let line = account_usage_line("Codex usage", &usage, now);
         assert!(line.contains("Weekly 0%"));
         assert!(line.contains("5h unavailable"));
 
@@ -2156,10 +2427,10 @@ mod tests {
             confidence: Confidence::High,
             detail: None,
         };
-        assert!(account_usage_line(&expired, now).contains("5h awaiting update"));
+        assert!(account_usage_line("Codex usage", &expired, now).contains("5h awaiting update"));
         assert_eq!(
-            account_usage_line(&Observed::unknown(), now),
-            "Usage left: unavailable"
+            account_usage_line("Codex usage", &Observed::unknown(), now),
+            "Codex usage: unavailable"
         );
     }
 
@@ -2195,6 +2466,8 @@ mod tests {
                             unknown: 0,
                         },
                         account_usage: &Observed::unknown(),
+                        kiro_account_usage: &Observed::unknown(),
+                        provider: "codex",
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
                         last_refresh_label: "just now",
@@ -2429,7 +2702,134 @@ mod tests {
         assert!(matches_filter_query(&row, "planner"));
         assert!(matches_filter_query(&row, "gpt-4"));
         assert!(matches_filter_query(&row, "c:\\users"));
+        assert!(matches_filter_query(&row, "codex"));
         assert!(!matches_filter_query(&row, "does-not-exist"));
+    }
+
+    #[test]
+    fn tui_card_shows_kiro_source_kind_without_changing_card_height() {
+        let mut snapshot = make_snapshot(
+            "kiro:native-1",
+            None,
+            Some("agent"),
+            None,
+            ThreadState::Idle,
+            None,
+            Some("/work/kiro"),
+            None,
+            Some(("kiro-model", "high")),
+            None,
+        );
+        snapshot.source_kind = Some("kiro_cli".to_string());
+        let row = build_list_row(&snapshot, 0, Utc::now());
+        let mut terminal = Terminal::new(TestBackend::new(100, AGENT_CARD_LINES as u16)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_agent_card(frame, frame.area(), &row, true);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("kiro_cli"));
+        assert!(rendered.contains("[Kiro]"));
+    }
+
+    #[test]
+    fn mixed_header_keeps_both_provider_balances_visible_at_supported_widths() {
+        let thread = make_snapshot(
+            "mixed",
+            Some("Mixed task"),
+            None,
+            None,
+            ThreadState::Idle,
+            None,
+            Some("/work/mixed"),
+            None,
+            None,
+            None,
+        );
+        let row = build_list_row(&thread, 0, Utc::now());
+        let now = Utc::now();
+        let codex_usage = Observed {
+            value: Some(AccountUsage {
+                primary: Some(AccountUsageWindow {
+                    used_percent: Some(19.0),
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: None,
+            }),
+            source: None,
+            observed_at: Some(now),
+            confidence: Confidence::High,
+            detail: None,
+        };
+        let kiro_usage = Observed {
+            value: Some(KiroAccountUsage {
+                plan_name: Some("KIRO PRO".to_string()),
+                billing_cycle_reset: Some("2026-10-01".to_string()),
+                plan_credits: Some(KiroCreditBalance {
+                    used: 199.67,
+                    total: 1000.0,
+                    remaining: 800.33,
+                }),
+                bonus_credits: Vec::new(),
+                add_on_credits: Vec::new(),
+            }),
+            source: None,
+            observed_at: Some(now),
+            confidence: Confidence::Medium,
+            detail: None,
+        };
+        for width in [70, 80, 100, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let rows = vec![row.clone()];
+                    render_tui_view(
+                        frame,
+                        frame.area(),
+                        &TuiViewState {
+                            visible_rows: &rows,
+                            selected_snapshot: Some(&thread),
+                            counts: &StateCounts {
+                                running: 0,
+                                idle: 1,
+                                unknown: 0,
+                            },
+                            account_usage: &codex_usage,
+                            kiro_account_usage: &kiro_usage,
+                            provider: "all",
+                            selected: 0,
+                            state_filter: &LocalStateFilter::All,
+                            last_refresh_label: "just now",
+                            show_activity: false,
+                            show_technical: false,
+                            show_help: false,
+                            search_mode: false,
+                            search_query: "",
+                        },
+                    );
+                })
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Codex usage:"), "width {width}");
+            assert!(rendered.contains("Kiro credits:"), "width {width}");
+            assert!(rendered.contains("800.33"), "width {width}");
+            assert!(rendered.contains("1000.00"), "width {width}");
+            assert!(rendered.contains("Codex + Kiro Monitor"), "width {width}");
+        }
     }
 
     #[test]
@@ -2538,5 +2938,176 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["newest", "updated", "oldest", "unknown"]
         );
+    }
+}
+
+#[cfg(test)]
+mod kiro_task_progress_tests {
+    use super::*;
+    use crate::model::{
+        Confidence, ContextUsage, EvidenceSource, TaskProgress, TaskStatus, ThreadTask,
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn context_observation() -> Observed<ContextUsage> {
+        Observed {
+            value: Some(ContextUsage {
+                used_percent: 94.69118,
+                used_tokens_approx: 257_560,
+                context_window_tokens: 272_000,
+            }),
+            source: Some(EvidenceSource {
+                kind: "kiro.session.context_usage".to_string(),
+                detail: None,
+            }),
+            observed_at: None,
+            confidence: Confidence::Medium,
+            detail: Some("current context; not cumulative".to_string()),
+        }
+    }
+
+    #[test]
+    fn kiro_task_progress_is_visible_on_card_and_details() {
+        let mut snapshot = tests::make_snapshot(
+            "kiro:task-session-12345678",
+            None,
+            Some("default"),
+            None,
+            ThreadState::Unknown,
+            None,
+            Some("/work/tasks"),
+            None,
+            Some(("kiro-model", "high")),
+            None,
+        );
+        snapshot.source_kind = Some("kiro_cli".to_string());
+        snapshot.context_usage = context_observation();
+        snapshot.task_progress = Observed {
+            value: Some(TaskProgress {
+                tasks: vec![
+                    ThreadTask {
+                        id: 1,
+                        status: TaskStatus::InProgress,
+                    },
+                    ThreadTask {
+                        id: 2,
+                        status: TaskStatus::Completed,
+                    },
+                    ThreadTask {
+                        id: 3,
+                        status: TaskStatus::Pending,
+                    },
+                ],
+            }),
+            source: Some(EvidenceSource {
+                kind: "kiro.tasks".to_string(),
+                detail: None,
+            }),
+            observed_at: None,
+            confidence: Confidence::Medium,
+            detail: None,
+        };
+
+        assert_eq!(display_name(&snapshot), "Main task 12345678");
+        let row = build_list_row(&snapshot, 0, Utc::now());
+        let mut card = Terminal::new(TestBackend::new(100, AGENT_CARD_LINES as u16)).unwrap();
+        card.draw(|frame| render_agent_card(frame, frame.area(), &row, true))
+            .unwrap();
+        let card_text = card
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(card_text.contains("Tasks 1/3"));
+        assert!(card_text.contains("Ctx ~257.6k"));
+        assert!(!card_text.contains("Tokens ?"));
+
+        let mut details = Terminal::new(TestBackend::new(100, 42)).unwrap();
+        details
+            .draw(|frame| {
+                render_details_pane(frame, frame.area(), &snapshot, false, false, true);
+            })
+            .unwrap();
+        let detail_text = details
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(detail_text.contains("Task progress"));
+        assert!(detail_text.contains("1/3 completed"));
+        assert!(detail_text.contains("1 active"));
+        assert!(detail_text.contains("1 pending"));
+        assert!(detail_text.contains("#1 in progress"));
+        assert!(detail_text.contains("#2 completed"));
+        assert!(detail_text.contains("#3 pending"));
+        assert!(detail_text.contains("Context usage"));
+        assert!(detail_text.contains("94.7% used"));
+        assert!(detail_text.contains("approximately 257,560 / 272,000 tokens"));
+        assert!(detail_text.contains("current, not cumulative"));
+        assert!(detail_text.contains("kiro.session.context_usage"));
+    }
+
+    #[test]
+    fn kiro_missing_task_plan_is_explicit_while_context_remains_visible() {
+        let mut snapshot = tests::make_snapshot(
+            "kiro:no-plan-12345678",
+            None,
+            Some("default"),
+            None,
+            ThreadState::Idle,
+            None,
+            Some("/work/no-plan"),
+            None,
+            Some(("kiro-model", "high")),
+            None,
+        );
+        snapshot.source_kind = Some("kiro_cli".to_string());
+        snapshot.context_usage = context_observation();
+        snapshot.task_progress = Observed {
+            value: None,
+            source: Some(EvidenceSource {
+                kind: "kiro.tasks".to_string(),
+                detail: None,
+            }),
+            observed_at: None,
+            confidence: Confidence::Low,
+            detail: Some("Kiro did not persist a task plan".to_string()),
+        };
+
+        let row = build_list_row(&snapshot, 0, Utc::now());
+        let mut card = Terminal::new(TestBackend::new(100, AGENT_CARD_LINES as u16)).unwrap();
+        card.draw(|frame| render_agent_card(frame, frame.area(), &row, true))
+            .unwrap();
+        let card_text = card
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(card_text.contains("Ctx ~257.6k"));
+        assert!(!card_text.contains("Tokens ?"));
+
+        let mut details = Terminal::new(TestBackend::new(100, 36)).unwrap();
+        details
+            .draw(|frame| {
+                render_details_pane(frame, frame.area(), &snapshot, false, false, true);
+            })
+            .unwrap();
+        let detail_text = details
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(detail_text.contains("Task progress"));
+        assert!(detail_text.contains("Unavailable: Kiro did not persist a task plan"));
+        assert!(detail_text.contains("Context usage"));
+        assert!(detail_text.contains("approximately 257,560 / 272,000 tokens"));
     }
 }

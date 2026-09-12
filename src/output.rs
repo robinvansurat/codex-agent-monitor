@@ -1,12 +1,40 @@
 use crate::model::{
-    ActivitySignal, LastTerminalEvent, ModelSpec, Observed, ProbeOutput, ThreadState, TokenUsage,
+    ActivitySignal, ContextUsage, KiroAccountUsage, LastTerminalEvent, ModelSpec, Observed,
+    ProbeOutput, TaskProgress, ThreadState, TokenUsage,
 };
+use chrono::Utc;
 
 pub fn render_human(summary: &ProbeOutput) -> String {
     let mut out = String::new();
     out.push_str(&format!("schema: {}\n", summary.schema_version));
     out.push_str(&format!("generated: {}\n", summary.generated_at));
     out.push_str(&format!("codex home: {}\n", summary.codex_home));
+    out.push_str(&format!(
+        "monitor: {}\n",
+        match summary.query.provider.as_deref() {
+            Some("kiro") => "Kiro Agent Monitor",
+            Some("all") => "Codex + Kiro Monitor",
+            _ => "Codex Agent Monitor",
+        }
+    ));
+    if matches!(
+        summary.query.provider.as_deref(),
+        Some("codex") | Some("all") | None
+    ) {
+        out.push_str(&format!(
+            "codex usage: {}\n",
+            codex_usage_label(&summary.account_usage)
+        ));
+    }
+    if matches!(
+        summary.query.provider.as_deref(),
+        Some("kiro") | Some("all")
+    ) {
+        out.push_str(&format!(
+            "kiro credits: {}\n",
+            kiro_usage_label(&summary.kiro_account_usage)
+        ));
+    }
     if !summary.warnings.is_empty() {
         out.push_str("warnings:\n");
         for w in &summary.warnings {
@@ -35,8 +63,9 @@ fn render_node(
         .find(|x| x.thread_id == node.thread_id)
     {
         out.push_str(&format!(
-            "{}- {}  state={}  role={}  parent={}\n",
+            "{}- [{}] {}  state={}  role={}  parent={}\n",
             prefix,
+            provider_label(t.source_kind.as_deref()),
             t.thread_id,
             state_label(&t.state),
             t.role.clone().unwrap_or_else(|| "-".to_string()),
@@ -74,7 +103,7 @@ fn render_node(
             prefix,
             t.cwd.clone().unwrap_or_else(|| "-".to_string()),
             source_label(&t.evidence.cwd.source),
-            t.source_kind.clone().unwrap_or_else(|| "-".to_string()),
+            friendly_source_kind(t.source_kind.as_deref()),
             source_label(&t.evidence.source_kind.source),
         ));
         out.push_str(&format!(
@@ -101,6 +130,41 @@ fn render_node(
             observed_token_usage_label(&t.token_usage),
             source_label(&t.token_usage.source),
         ));
+        if t.context_usage.value.is_some() {
+            out.push_str(&format!(
+                "{}  context usage: {} (source={})\n",
+                prefix,
+                observed_context_usage_label(&t.context_usage),
+                source_label(&t.context_usage.source),
+            ));
+        }
+        if let Some(progress) = t.task_progress.value.as_ref() {
+            out.push_str(&format!(
+                "{}  task progress: {} (source={})\n",
+                prefix,
+                task_progress_label(progress),
+                source_label(&t.task_progress.source),
+            ));
+            if !progress.tasks.is_empty() {
+                let tasks = progress
+                    .tasks
+                    .iter()
+                    .map(|task| format!("#{} {}", task.id, task.status.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("{}  tasks: {tasks}\n", prefix));
+            }
+        } else if let Some(detail) = t
+            .task_progress
+            .detail
+            .as_deref()
+            .filter(|detail| *detail != "No local evidence")
+        {
+            out.push_str(&format!(
+                "{}  task progress: unavailable ({detail})\n",
+                prefix
+            ));
+        }
         if let Some(eff) = &t.model.rerouted_from {
             out.push_str(&format!(
                 "{}  rerouted from: {} (source={})\n",
@@ -129,6 +193,108 @@ fn render_node(
     for c in &node.children {
         render_node(c, snapshot, depth + 1, out);
     }
+}
+
+fn provider_label(source_kind: Option<&str>) -> &'static str {
+    if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
+        "Kiro"
+    } else {
+        "Codex"
+    }
+}
+
+fn friendly_source_kind(source_kind: Option<&str>) -> &'static str {
+    match source_kind {
+        Some("kiro_cli") => "Kiro CLI",
+        Some("kiro_acp") => "Kiro ACP worker",
+        Some(_) => "Codex",
+        None => "unknown",
+    }
+}
+
+fn codex_usage_label(observed: &Observed<crate::model::AccountUsage>) -> String {
+    let Some(value) = observed.value.as_ref() else {
+        return "unavailable".to_string();
+    };
+    let mut windows = Vec::new();
+    for window in [value.primary.as_ref(), value.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let remaining = if window.resets_at.is_some_and(|reset| reset <= Utc::now()) {
+            "awaiting update".to_string()
+        } else {
+            window
+                .used_percent
+                .map(|used| format!("{:.0}%", (100.0 - used).clamp(0.0, 100.0)))
+                .unwrap_or_else(|| "unavailable".to_string())
+        };
+        let duration = window
+            .window_minutes
+            .map(codex_duration_label)
+            .unwrap_or_else(|| "unknown window".to_string());
+        windows.push(format!("{duration} {remaining}"));
+    }
+    if windows.is_empty() {
+        "unavailable".to_string()
+    } else {
+        windows.join(" · ")
+    }
+}
+
+fn codex_duration_label(minutes: u64) -> String {
+    match minutes {
+        300 => "5h".to_string(),
+        10_080 => "Weekly".to_string(),
+        minutes if minutes % (24 * 60) == 0 => format!("{}d", minutes / (24 * 60)),
+        minutes if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        minutes => format!("{}m", minutes),
+    }
+}
+
+fn kiro_usage_label(observed: &Observed<KiroAccountUsage>) -> String {
+    let Some(value) = observed.value.as_ref() else {
+        return observed
+            .detail
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string());
+    };
+    let Some(plan) = value.plan_credits.as_ref() else {
+        return "unavailable".to_string();
+    };
+    let stale = if observed.confidence == crate::model::Confidence::Low {
+        "(stale) "
+    } else {
+        ""
+    };
+    let mut label = format!(
+        "{stale}{:.2} left / {:.2} plan credits",
+        plan.remaining, plan.total
+    );
+    if let Some(reset) = value.billing_cycle_reset.as_deref() {
+        label.push_str(&format!(" (reset {reset})"));
+    }
+    for bonus in &value.bonus_credits {
+        let Some(days) = bonus.days_until_expiry else {
+            continue;
+        };
+        let expiry = if days == 0 {
+            "expires today".to_string()
+        } else {
+            format!("expires in {days}d")
+        };
+        label.push_str(&format!(
+            "; bonus {} {:.2} remaining ({expiry})",
+            bonus.name.as_deref().unwrap_or("credits"),
+            bonus.remaining
+        ));
+    }
+    for add_on in &value.add_on_credits {
+        if add_on.is_active == Some(true) {
+            label.push_str(&format!("; add-on {:.2} remaining", add_on.remaining));
+        }
+    }
+    label
 }
 
 fn source_label(source: &Option<crate::model::EvidenceSource>) -> &str {
@@ -168,6 +334,14 @@ fn terminal_event_label(event: &LastTerminalEvent) -> &'static str {
     }
 }
 
+fn task_progress_label(progress: &TaskProgress) -> String {
+    format!(
+        "{}/{} completed",
+        progress.completed_count(),
+        progress.tasks.len()
+    )
+}
+
 fn observed_model_label(value: &Observed<ModelSpec>) -> String {
     let details = value
         .value
@@ -201,6 +375,18 @@ fn observed_token_usage_label(value: &Observed<TokenUsage>) -> String {
         token_count_label(usage.output_tokens),
         token_count_label(usage.reasoning_output_tokens),
         token_count_label(usage.context_window),
+    )
+}
+
+fn observed_context_usage_label(value: &Observed<ContextUsage>) -> String {
+    let Some(usage) = value.value.as_ref() else {
+        return "unavailable".to_string();
+    };
+    format!(
+        "{:.1}% used (approximately {} / {} tokens) [current context, not cumulative]",
+        usage.used_percent,
+        format_count(usage.used_tokens_approx),
+        format_count(usage.context_window_tokens),
     )
 }
 

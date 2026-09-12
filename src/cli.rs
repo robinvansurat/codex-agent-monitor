@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "codex-agent-monitor")]
-#[command(about = "Inspect Codex thread activity from persisted state")]
+#[command(about = "Inspect Codex and Kiro thread activity from persisted state")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -17,6 +17,16 @@ pub struct Cli {
 
 #[derive(Args, Debug, Clone)]
 pub struct SharedArgs {
+    #[arg(long, value_enum, default_value_t = Provider::All, global = true)]
+    pub provider: Provider,
+    #[arg(long, global = true, env = "KIRO_HOME")]
+    pub kiro_home: Option<String>,
+    #[arg(long, global = true)]
+    pub kiro_db: Option<String>,
+    #[arg(long, global = true)]
+    pub kiro_cli: Option<String>,
+    #[arg(long, global = true)]
+    pub no_kiro_usage: bool,
     #[arg(long, default_value = "false", global = true)]
     pub all: bool,
     #[arg(long, global = true)]
@@ -55,6 +65,14 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Provider {
+    Codex,
+    Kiro,
+    #[default]
+    All,
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     Probe,
@@ -64,6 +82,11 @@ pub enum Command {
 
 #[derive(Debug, Default, Clone)]
 pub struct FilterOpts {
+    pub provider: Provider,
+    pub kiro_home: Option<String>,
+    pub kiro_db: Option<String>,
+    pub kiro_cli: Option<String>,
+    pub no_kiro_usage: bool,
     pub all: bool,
     pub project: Option<String>,
     pub thread: Option<String>,
@@ -98,6 +121,11 @@ pub fn selected_command(cli: &Cli) -> Command {
 
 fn global_filter(cli: &Cli) -> FilterOpts {
     FilterOpts {
+        provider: cli.shared.provider.clone(),
+        kiro_home: cli.shared.kiro_home.clone(),
+        kiro_db: cli.shared.kiro_db.clone(),
+        kiro_cli: cli.shared.kiro_cli.clone(),
+        no_kiro_usage: cli.shared.no_kiro_usage,
         all: cli.shared.all,
         project: cli.shared.project.clone(),
         thread: cli.shared.thread.clone(),
@@ -193,5 +221,16 @@ mod tests {
         let opts = merge_tui_args(&cli);
         assert!(opts.all);
         assert_eq!(opts.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn provider_defaults_to_all_and_allows_explicit_codex() {
+        let default_cli = Cli::try_parse_from(["codex-agent-monitor"]).expect("parse default CLI");
+        assert_eq!(merge_tui_args(&default_cli).provider, Provider::All);
+        assert_eq!(Provider::default(), Provider::All);
+
+        let codex_cli = Cli::try_parse_from(["codex-agent-monitor", "--provider", "codex"])
+            .expect("parse explicit Codex provider");
+        assert_eq!(merge_tui_args(&codex_cli).provider, Provider::Codex);
     }
 }

@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod kiro;
+pub mod kiro_usage;
 pub mod model;
 pub mod observer;
 pub mod output;

@@ -15,7 +15,14 @@ use serde_json::to_string_pretty;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut monitor = Monitor::new(cli.codex_home.clone())?;
+    let mut monitor = Monitor::new_with_sources_and_usage(
+        cli.codex_home.clone(),
+        cli.shared.kiro_home.clone(),
+        cli.shared.kiro_db.clone(),
+        cli.shared.provider.clone(),
+        cli.shared.kiro_cli.clone(),
+        cli.shared.no_kiro_usage,
+    )?;
     let command = selected_command(&cli);
 
     match command {
@@ -37,7 +44,7 @@ fn main() -> Result<()> {
 
 fn run_probe(monitor: &mut Monitor, opts: codex_agent_monitor::cli::FilterOpts) -> Result<()> {
     let runtime = RuntimeOverlay::from_source(opts.runtime_events.as_deref());
-    let snapshot = monitor.probe_snapshot(&opts, runtime, true)?;
+    let snapshot = monitor.probe_snapshot_with_usage_wait(&opts, runtime, true)?;
     if matches!(opts.format, codex_agent_monitor::cli::OutputFormat::Json) {
         println!("{}", to_string_pretty(&snapshot)?);
     } else {

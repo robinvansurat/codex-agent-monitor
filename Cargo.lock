@@ -197,6 +197,7 @@ dependencies = [
  "clap",
  "crossterm 0.29.0",
  "dirs",
+ "libc",
  "pretty_assertions",
  "ratatui",
  "rusqlite",
@@ -204,6 +205,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
