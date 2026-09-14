@@ -215,3 +215,5 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --release --locked
 ```
+
+build get codex-agent-monitor : cargo install --path . --force --locked
