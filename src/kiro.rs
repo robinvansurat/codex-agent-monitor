@@ -4,13 +4,14 @@
 //! never retains titles, prompts, message bodies, arguments, or tool results.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 
 use crate::model::{ContextUsage, TaskProgress, TaskStatus, ThreadState, ThreadTask};
 use crate::rollout::{RolloutActivity, RolloutTerminalEvent};
@@ -82,10 +83,20 @@ pub fn read_snapshot(
     db_override: Option<&Path>,
     home_was_explicit: bool,
 ) -> KiroSnapshot {
+    let mut event_buffer = String::new();
+    read_snapshot_with_buffer(home, db_override, home_was_explicit, &mut event_buffer)
+}
+
+pub(crate) fn read_snapshot_with_buffer(
+    home: &Path,
+    db_override: Option<&Path>,
+    home_was_explicit: bool,
+    event_buffer: &mut String,
+) -> KiroSnapshot {
     let mut snapshot = KiroSnapshot::default();
     let mut by_id = HashMap::<String, KiroThreadRecord>::new();
 
-    let native = read_native(home);
+    let native = read_native(home, event_buffer);
     snapshot.warnings.extend(native.warnings);
     for thread in native.threads {
         by_id.insert(thread.id.clone(), thread);
@@ -175,7 +186,7 @@ fn native_context_usage(
     })
 }
 
-fn read_native(home: &Path) -> KiroSnapshot {
+fn read_native(home: &Path, event_buffer: &mut String) -> KiroSnapshot {
     let mut out = KiroSnapshot::default();
     let dir = home.join("sessions").join("cli");
     let entries = match immediate_entries(&dir, &mut out.warnings) {
@@ -257,7 +268,7 @@ fn read_native(home: &Path) -> KiroSnapshot {
         }
         let jsonl = path.with_extension("jsonl");
         let (activities, latest_prompt, latest_event) =
-            read_native_events(&jsonl, &mut out.warnings);
+            read_native_events(&jsonl, &mut out.warnings, event_buffer);
         let tasks_dir = path.with_extension("").join("tasks");
         let (task_progress, task_progress_at) = read_native_tasks(&tasks_dir, &mut out.warnings);
         let pending_prompt = latest_prompt.filter(|prompt| {
@@ -374,7 +385,7 @@ fn native_session_lock_is_live(path: &Path, warnings: &mut Vec<String>) -> bool 
 }
 
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -384,7 +395,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -406,11 +417,16 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     false
 }
 
-fn read_native_events(path: &Path, warnings: &mut Vec<String>) -> NativeEventParse {
+fn read_native_events(
+    path: &Path,
+    warnings: &mut Vec<String>,
+    line: &mut String,
+) -> NativeEventParse {
+    line.clear();
     if is_symlink_or_parent(path) {
         warnings.push(format!(
             "skipping symlinked Kiro native event log: {}",
@@ -418,26 +434,44 @@ fn read_native_events(path: &Path, warnings: &mut Vec<String>) -> NativeEventPar
         ));
         return (Vec::new(), None, None);
     }
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Ok(file) = File::open(path) else {
         return (Vec::new(), None, None);
     };
+    let mut reader = BufReader::new(file);
     let mut activities = Vec::new();
     let mut tool_names = HashMap::<String, String>::new();
     let mut latest_prompt = None;
     let mut latest_event = None;
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    loop {
+        line.clear();
+        let Ok(bytes) = reader.read_line(line) else {
+            break;
+        };
+        if bytes == 0 {
+            break;
+        }
+        let Ok(raw) = serde_json::from_str::<&RawValue>(line) else {
             warnings.push(format!("malformed Kiro native event in {}", path.display()));
             continue;
         };
-        let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+        let Ok(root) = serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()) else {
             continue;
         };
-        let data = value.get("data").unwrap_or(&Value::Null);
-        let timestamp = data
-            .get("meta")
-            .and_then(|v| v.get("timestamp"))
-            .and_then(parse_unix_timestamp);
+        let Some(kind) = root.get("kind").and_then(raw_string_value) else {
+            continue;
+        };
+        let data = root
+            .get("data")
+            .and_then(|raw| serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()).ok());
+        let timestamp = data.as_ref().and_then(|data| {
+            let meta = data.get("meta").and_then(|raw| {
+                serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()).ok()
+            })?;
+            let ts = meta
+                .get("timestamp")
+                .and_then(|raw| serde_json::from_str::<i64>(raw.get()).ok())?;
+            Utc.timestamp_opt(ts, 0).single()
+        });
         latest_event = max_time(latest_event, timestamp);
         if kind == "Prompt" {
             latest_prompt = max_time(latest_prompt, timestamp);
@@ -449,24 +483,36 @@ fn read_native_events(path: &Path, warnings: &mut Vec<String>) -> NativeEventPar
             });
             continue;
         }
-
         let content = data
-            .get("content")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .as_ref()
+            .and_then(|data| data.get("content"))
+            .and_then(|raw| serde_json::from_str::<Vec<&RawValue>>(raw.get()).ok())
+            .unwrap_or_default();
         let mut emitted_detail = false;
         if kind == "AssistantMessage" {
             for item in content {
-                if item.get("kind").and_then(Value::as_str) != Some("toolUse") {
+                let Ok(item) = serde_json::from_str::<HashMap<String, &RawValue>>(item.get())
+                else {
+                    continue;
+                };
+                if item.get("kind").and_then(raw_string_value).as_deref() != Some("toolUse") {
                     continue;
                 }
-                let detail = item.get("data").unwrap_or(&Value::Null);
-                let tool_name = string_at(detail, &["name"]);
-                if let (Some(tool_id), Some(tool_name)) =
-                    (string_at(detail, &["toolUseId"]), tool_name.clone())
-                {
-                    tool_names.insert(tool_id, tool_name);
+                let detail = item.get("data").and_then(|raw| {
+                    serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()).ok()
+                });
+                let tool_name = detail
+                    .as_ref()
+                    .and_then(|d| d.get("name"))
+                    .and_then(raw_string_value);
+                if let (Some(id), Some(name)) = (
+                    detail
+                        .as_ref()
+                        .and_then(|d| d.get("toolUseId"))
+                        .and_then(raw_string_value),
+                    tool_name.clone(),
+                ) {
+                    tool_names.insert(id, name);
                 }
                 activities.push(RolloutActivity {
                     kind: "tool_call".to_string(),
@@ -488,16 +534,29 @@ fn read_native_events(path: &Path, warnings: &mut Vec<String>) -> NativeEventPar
         }
         if kind == "ToolResults" {
             for item in content {
-                if item.get("kind").and_then(Value::as_str) != Some("toolResult") {
+                let Ok(item) = serde_json::from_str::<HashMap<String, &RawValue>>(item.get())
+                else {
+                    continue;
+                };
+                if item.get("kind").and_then(raw_string_value).as_deref() != Some("toolResult") {
                     continue;
                 }
-                let detail = item.get("data").unwrap_or(&Value::Null);
-                let tool_name = string_at(detail, &["toolUseId"])
-                    .and_then(|tool_id| tool_names.get(&tool_id).cloned());
+                let detail = item.get("data").and_then(|raw| {
+                    serde_json::from_str::<HashMap<String, &RawValue>>(raw.get()).ok()
+                });
+                let tool_name = detail
+                    .as_ref()
+                    .and_then(|d| d.get("toolUseId"))
+                    .and_then(raw_string_value)
+                    .and_then(|id| tool_names.get(&id).cloned());
+                let status = detail
+                    .as_ref()
+                    .and_then(|d| d.get("status"))
+                    .and_then(raw_string_value);
                 activities.push(RolloutActivity {
                     kind: "tool_result".to_string(),
                     tool_name,
-                    status: string_at(detail, &["status"]),
+                    status,
                     ts: timestamp,
                 });
                 emitted_detail = true;
@@ -512,7 +571,6 @@ fn read_native_events(path: &Path, warnings: &mut Vec<String>) -> NativeEventPar
             }
             continue;
         }
-
         activities.push(RolloutActivity {
             kind: kind.to_ascii_lowercase(),
             tool_name: None,
@@ -520,7 +578,12 @@ fn read_native_events(path: &Path, warnings: &mut Vec<String>) -> NativeEventPar
             ts: timestamp,
         });
     }
+    line.clear();
     (activities, latest_prompt, latest_event)
+}
+
+fn raw_string_value(raw: &&RawValue) -> Option<String> {
+    serde_json::from_str::<String>(raw.get()).ok()
 }
 
 const MAX_KIRO_TASKS: usize = 1_000;
@@ -1127,13 +1190,6 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 
 fn parse_rfc3339_value(value: &Value) -> Option<DateTime<Utc>> {
     value.as_str().and_then(parse_rfc3339)
-}
-
-fn parse_unix_timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    let number = value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))?;
-    Utc.timestamp_opt(number, 0).single()
 }
 
 fn parse_millis(value: i64) -> Option<DateTime<Utc>> {

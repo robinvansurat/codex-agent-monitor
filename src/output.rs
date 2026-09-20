@@ -12,8 +12,10 @@ pub fn render_human(summary: &ProbeOutput) -> String {
     out.push_str(&format!(
         "monitor: {}\n",
         match summary.query.provider.as_deref() {
+            Some("claude") => "Claude Agent Monitor",
             Some("kiro") => "Kiro Agent Monitor",
-            Some("all") => "Codex + Kiro Monitor",
+            Some("ollama") => "Ollama Agent Monitor",
+            Some("all") => "Codex + Claude + Kiro (Ollama)",
             _ => "Codex Agent Monitor",
         }
     ));
@@ -25,6 +27,34 @@ pub fn render_human(summary: &ProbeOutput) -> String {
             "codex usage: {}\n",
             codex_usage_label(&summary.account_usage)
         ));
+    }
+    if matches!(
+        summary.query.provider.as_deref(),
+        Some("claude") | Some("all")
+    ) {
+        let (tokens, sessions) = claude_token_summary(&summary.threads);
+        out.push_str(&format!(
+            "claude usage: {}; tokens: {}; sessions: {}\n",
+            codex_usage_label(&summary.claude_account_usage),
+            format_count(tokens),
+            sessions
+        ));
+    }
+    if matches!(
+        summary.query.provider.as_deref(),
+        Some("ollama") | Some("all")
+    ) {
+        let status = if summary.ollama_server.available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        let models = if summary.ollama_server.loaded_models.is_empty() {
+            "none".to_string()
+        } else {
+            summary.ollama_server.loaded_models.join(", ")
+        };
+        out.push_str(&format!("ollama api: {status}; loaded models: {models}\n"));
     }
     if matches!(
         summary.query.provider.as_deref(),
@@ -196,7 +226,11 @@ fn render_node(
 }
 
 fn provider_label(source_kind: Option<&str>) -> &'static str {
-    if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
+    if matches!(source_kind, Some("ollama_desktop") | Some("ollama_cli")) {
+        "Ollama"
+    } else if matches!(source_kind, Some("claude_code")) {
+        "Claude"
+    } else if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
         "Kiro"
     } else {
         "Codex"
@@ -205,6 +239,9 @@ fn provider_label(source_kind: Option<&str>) -> &'static str {
 
 fn friendly_source_kind(source_kind: Option<&str>) -> &'static str {
     match source_kind {
+        Some("ollama_desktop") => "Ollama Desktop",
+        Some("ollama_cli") => "Ollama CLI",
+        Some("claude_code") => "Claude Code",
         Some("kiro_cli") => "Kiro CLI",
         Some("kiro_acp") => "Kiro ACP worker",
         Some(_) => "Codex",
@@ -394,6 +431,23 @@ fn token_count_label(value: Option<u64>) -> String {
     value
         .map(format_count)
         .unwrap_or_else(|| "<none>".to_string())
+}
+
+/// Claude Code persists no account allowance, so the summary reports observed
+/// tokens across the listed sessions rather than a quota.
+fn claude_token_summary(threads: &[crate::model::ThreadSnapshot]) -> (u64, usize) {
+    threads
+        .iter()
+        .filter(|thread| thread.source_kind.as_deref() == Some("claude_code"))
+        .fold((0_u64, 0_usize), |(tokens, sessions), thread| {
+            let total = thread
+                .token_usage
+                .value
+                .as_ref()
+                .and_then(|usage| usage.total_tokens)
+                .unwrap_or(0);
+            (tokens.saturating_add(total), sessions + 1)
+        })
 }
 
 fn format_count(value: u64) -> String {

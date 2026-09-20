@@ -1,6 +1,6 @@
 # codex-agent-monitor
 
-`codex-agent-monitor` is an open-source read-only local monitor for Codex and Kiro persisted state.
+`codex-agent-monitor` is an open-source read-only local monitor for Codex, Claude Code, Kiro, and Ollama persisted state.
 
 ## What it is / is not
 
@@ -27,7 +27,10 @@ It is **not**:
 - Show the latest account usage allowance observed in monitored rollout `rate_limits` events
 - Optional TUI for navigation and thread details
 - Optional `--runtime-events` overlay (`model/rerouted`) for ephemeral effective model/reroute facts
+- Claude Code CLI session inspection with `--provider claude` or `--provider all`, including per-session cumulative token counters and live-process state
 - Kiro CLI and ACP session inspection with `--provider kiro` or `--provider all`
+- Ollama Desktop chat metadata with `--provider ollama` or `--provider all`; local Ollama API availability and loaded model names are reported when reachable
+- Live `ollama run <model>` process rows with safe model/PID telemetry; Desktop chats remain persisted history and API models remain status-only
 - Kiro native task progress (numeric task IDs and normalized statuses only) plus safe native tool call/result activity
 
 ## Install/build
@@ -59,9 +62,12 @@ Commands:
 
 Global/command options include:
 
-- `--provider {codex,kiro,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode)
+- `--provider {codex,claude,kiro,ollama,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode)
+- `--claude-home <path>` (or `CLAUDE_CONFIG_DIR`): Claude Code home to inspect; defaults to `~/.claude`
+- `--claude-usage-file <path>`: explicit Claude plan utilisation history; otherwise the Claude desktop app's `plan-usage-history.json` is used
 - `--kiro-home <path>` (or `KIRO_HOME`): Kiro home to inspect; defaults to `~/.kiro`
 - `--kiro-db <path>`: explicit legacy Kiro SQLite database override
+- `--ollama-db <path>`: explicit Ollama Desktop SQLite database override; otherwise macOS `~/Library/Application Support/Ollama/db.sqlite` is used
 - `--kiro-cli <path>`: explicit `kiro-cli` executable for the authenticated Kiro credit lookup
 - `--no-kiro-usage`: skip the native authenticated Kiro credit lookup
 
@@ -114,6 +120,43 @@ Rollout parsing stores only non-sensitive telemetry fields:
 
 Message text, instructions, tool input/output, summaries, and results are intentionally not retained in memory or JSON output.
 
+Claude Code support follows the same policy. Transcripts under
+`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` are streamed read-only and
+only telemetry is retained: session ID, `cwd`, git branch, entrypoint, model,
+effort, timestamps, `stop_reason`, tool-call names, and tool-result status.
+Prompts, assistant text, thinking blocks, tool inputs and results,
+attachments, file-history snapshots, custom titles, and agent names are never
+read into memory or output. `~/.claude/history.jsonl` is not read at all
+because its rows carry prompt text. Claude IDs are shown as
+`claude:<session-id>`; `--thread` also accepts the raw session ID.
+
+Claude sessions are independent roots. Claude Code's `parentUuid` links
+messages inside one transcript rather than spawned sessions, and subagent turns
+are stored inline as `isSidechain` records, so the monitor does not synthesize
+parent/child thread edges for them. Sidechain turns still contribute their token
+counters, but never override the session's own model, effort, or workspace.
+
+Claude plan utilisation comes from the Claude desktop app's
+`plan-usage-history.json`, whose samples record a five-hour (`fh`) and
+seven-day (`sd`) percentage. The newest sample carrying a percentage is
+reported as the standard primary/secondary account windows; the `org` account
+identifier in that file is never read out. The history records utilisation
+only, so `resets_at` stays unknown rather than being estimated, and the
+displayed percentage is remaining allowance, matching the Codex line. When the
+desktop app is not installed the file is absent and the value stays unknown.
+
+Claude token usage is cumulative per session, summed across responses and
+de-duplicated by response ID, because one API response is persisted as several
+records that each repeat the same usage block. `total_tokens` is the sum of
+input, cache-read, cache-write, and output tokens. `context_window` stays
+unknown because Claude Code does not persist a window size, and for the same
+reason Claude rows expose no `context_usage`. Claude lifecycle state is
+conservative: a session is `running` only while `~/.claude/sessions/<pid>.json`
+registers it and that process is still visible, `idle` once records exist
+without a live process, and `unknown` for an empty transcript. As with the other
+providers, a live process means an open session, not necessarily an in-flight
+turn; `activity_signal` remains the freshness evidence.
+
 Kiro support follows the same policy. Native task files are read only from the
 session's adjacent `tasks` directory; the monitor retains numeric task IDs and
 normalized statuses, but never task subjects or descriptions. Native tool events
@@ -153,6 +196,7 @@ Examples:
 
 ```text
 codex-agent-monitor --provider kiro probe
+codex-agent-monitor --provider claude probe --json
 codex-agent-monitor --provider all --project /work/my-repo probe --json
 codex-agent-monitor --provider kiro --kiro-home /tmp/kiro tui
 codex-agent-monitor --provider kiro --no-kiro-usage probe
@@ -164,7 +208,7 @@ Controls:
 
 - `j`/`k` or `↑`/`↓` move selection
 - `f` toggles the local state filter between `All` and `Running`; `Running` is ordered newest-first by latest known activity
-- `/` enters search mode for provider (`codex`/`kiro`), name / ID / role / nickname / cwd / model / effort
+- `/` enters search mode for provider (`codex`/`claude`/`kiro`), name / ID / role / nickname / cwd / model / effort
 - `Enter` toggles recent activity expansion
 - `i` toggles technical details
 - `r` or `F5` forces an immediate snapshot refresh
