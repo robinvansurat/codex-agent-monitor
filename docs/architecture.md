@@ -4,6 +4,7 @@
 
 - `cli`: argument parsing (`clap`) and command normalization (`probe`/`watch`/`tui`)
 - `config`: resolve `CODEX_HOME`, `sqlite_home`, and read config files
+- `claude`: read-only ingestion for Claude Code transcripts and the live session registry
 - `kiro`: read-only ingestion for native CLI, ACP worker, and legacy SQLite sessions
 - `db`: read-only SQLite ingestion with schema/table introspection
 - `rollout`: stream parser for thread JSONL files
@@ -17,11 +18,74 @@
 - `state_5.sqlite` (required base of truth for thread list, timestamps, agent metadata, rollout file paths, parent edges)
 - rollout JSONL files referenced by thread rows (`rollout_path`)
 - optional runtime overlay source (`--runtime-events`)
+- Claude Code transcripts and the `sessions/<pid>.json` registry when `--provider`
+  is `claude` or `all`
 - Kiro session files and the legacy Kiro conversation database when `--provider`
   is `kiro` or `all`
 - optional native Kiro account lookup through `kiro-cli acp` for plan credits
+- Ollama Desktop's local SQLite database and live `ollama run` process list when
+  `--provider` is `ollama` or `all`, plus bounded read-only GET access to the
+  local `/api/ps` endpoint for server availability and loaded model names
 
 No writes are made to Codex files, DB, or runtime processes.
+
+## Claude Code ingestion
+
+Claude Code sessions use namespaced IDs (`claude:<session-id>`) and remain
+independent roots. Each transcript under
+`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` is streamed line by line
+with a line cap, and at most 500 transcripts are read, newest first by file
+modification time. The encoded directory name is only an index; `cwd` is taken
+from the records themselves because the encoding is not reversible for paths
+that already contain `-`. Malformed lines are counted and skipped rather than
+failing the read.
+
+`parentUuid` is a message-level link inside one transcript and subagent turns
+are inline `isSidechain` records, so neither is promoted to a thread parent
+edge. Sidechain records contribute token counters but do not set the session's
+model, effort, `cwd`, branch, or entrypoint.
+
+Token counters are summed across responses and de-duplicated by
+`message.id`, because Claude Code writes one record per content block and each
+repeats the response's usage. `context_window` is left unknown; Claude Code
+does not persist one, so no `context_usage` is derived.
+
+Plan utilisation is read from the Claude desktop app's
+`plan-usage-history.json` (`<config dir>/Claude/`), a bounded rolling list of
+`{t, org, u:{fh, sd}}` samples. The newest sample with at least one percentage
+becomes the primary (five-hour, 300 minutes) and secondary (seven-day, 10080
+minutes) account windows. Percentages outside 0-100 are discarded, `resets_at`
+is left unknown because the file records no window start, and the `org`
+account identifier is never retained.
+
+`sessions/<pid>.json` registers a running CLI process. An entry only makes a
+session `running` while its PID is still visible, reusing the same liveness
+check as the Kiro session lock. Stale entries are ignored, and a live process
+means an open session rather than an in-flight turn.
+
+Only telemetry is retained: session ID, `cwd`, git branch, entrypoint, model,
+effort, timestamps, `stop_reason`, tool-call names, and tool-result status.
+Prompts, assistant text, thinking, tool inputs and results, attachments, file
+snapshots, custom titles, and agent names are never retained.
+`~/.claude/history.jsonl` is not read because its rows carry prompt text.
+
+## Ollama ingestion
+
+Ollama Desktop chats use namespaced IDs (`ollama:<chat-id>`) and remain
+independent roots. The reader opens the Desktop database read-only with
+`query_only`, uses the known `chats`/`messages` metadata shape, limits traversal
+to 500 rows, and never selects titles, prompts, responses, thinking, or
+tool-content columns. Missing schemas produce warnings and no rows. Chat state
+is `running` only for a recent unfinished thinking interval, `idle` for
+persisted message activity, and `unknown` for empty chats or missing evidence.
+Loaded models from `/api/ps` are server observations and do not create agent
+rows or imply a running chat.
+
+Live terminal rows use namespaced IDs (`ollama:cli:<pid>`) and are running only
+because a matching `ollama run <model>` process exists. Process rows retain the
+PID, model token, elapsed-derived timestamps, and safe source label; prompts,
+remaining arguments, tokens, context, and parentage are discarded. Desktop
+rows use `ollama_desktop`, while terminal rows use `ollama_cli`.
 
 The JSON schema is `codex-agent-monitor.probe.v2`. Current thread state is
 limited to `running`, `idle`, and `unknown`; terminal lifecycle results are

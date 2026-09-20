@@ -26,6 +26,7 @@ use crate::model::{
     TokenUsage,
 };
 use crate::observer::Monitor;
+use crate::ollama::OllamaServerStatus;
 use crate::runtime::RuntimeOverlay;
 
 const REFRESH_INTERVAL_MS: u64 = 1000;
@@ -107,6 +108,7 @@ struct ListRow {
     model: String,
     effort: String,
     token_total: String,
+    token_total_value: Option<u64>,
     context_usage: Option<String>,
     task_progress: Option<String>,
     origin_label: String,
@@ -203,6 +205,8 @@ pub fn run_tui(monitor: &mut Monitor, filters: &FilterOpts) -> Result<()> {
                     counts: &counts,
                     account_usage: &active_snapshot.account_usage,
                     kiro_account_usage: &active_snapshot.kiro_account_usage,
+                    claude_account_usage: &active_snapshot.claude_account_usage,
+                    ollama_server: &active_snapshot.ollama_server,
                     provider: active_snapshot.query.provider.as_deref().unwrap_or("codex"),
                     selected: state.selected,
                     state_filter: &state.state_filter,
@@ -330,6 +334,8 @@ struct TuiViewState<'a> {
     counts: &'a StateCounts,
     account_usage: &'a Observed<AccountUsage>,
     kiro_account_usage: &'a Observed<KiroAccountUsage>,
+    claude_account_usage: &'a Observed<AccountUsage>,
+    ollama_server: &'a OllamaServerStatus,
     provider: &'a str,
     selected: usize,
     state_filter: &'a LocalStateFilter,
@@ -343,7 +349,21 @@ struct TuiViewState<'a> {
 
 fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_>) {
     let is_wide = size.width >= 100;
-    let header_height = if is_wide { 5 } else { 7 };
+    // Height follows the usage lines actually produced, so the two cannot drift.
+    let usage = usage_lines(
+        render_state.provider,
+        render_state.account_usage,
+        render_state.kiro_account_usage,
+        render_state.ollama_server,
+        render_state.claude_account_usage,
+        claude_token_summary(render_state.visible_rows),
+        Utc::now(),
+    );
+    let header_height = if is_wide {
+        3 + usage.len() as u16
+    } else {
+        5 + usage.len() as u16
+    };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -359,8 +379,7 @@ fn render_tui_view(frame: &mut Frame, size: Rect, render_state: &TuiViewState<'_
         frame,
         outer[0],
         render_state.counts,
-        render_state.account_usage,
-        render_state.kiro_account_usage,
+        &usage,
         render_state.provider,
         render_state.last_refresh_label,
         is_wide,
@@ -418,8 +437,7 @@ fn render_header(
     frame: &mut Frame,
     area: Rect,
     counts: &StateCounts,
-    account_usage: &Observed<AccountUsage>,
-    kiro_account_usage: &Observed<KiroAccountUsage>,
+    usage: &[String],
     provider: &str,
     last_refresh: &str,
     is_wide: bool,
@@ -458,11 +476,7 @@ fn render_header(
         ));
         let header_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
+            .constraints(vec![Constraint::Length(1); 1 + usage.len()])
             .split(inner);
         let row = Layout::default()
             .direction(Direction::Horizontal)
@@ -475,55 +489,126 @@ fn render_header(
         frame.render_widget(Paragraph::new(title), row[0]);
         frame.render_widget(Paragraph::new(status_line), row[1]);
         frame.render_widget(Paragraph::new(refresh).alignment(Alignment::Right), row[2]);
-        let usage = usage_lines(provider, account_usage, kiro_account_usage, Utc::now());
-        for (index, line) in usage.into_iter().take(2).enumerate() {
-            frame.render_widget(Paragraph::new(line), header_rows[1 + index]);
+        for (index, line) in usage.iter().enumerate() {
+            frame.render_widget(Paragraph::new(line.as_str()), header_rows[1 + index]);
         }
         return;
     }
 
     let header_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints(vec![Constraint::Length(1); 3 + usage.len()])
         .split(inner);
     frame.render_widget(Paragraph::new(title), header_rows[0]);
     frame.render_widget(Paragraph::new(status_line), header_rows[1]);
-    let usage = usage_lines(provider, account_usage, kiro_account_usage, Utc::now());
-    for (index, line) in usage.into_iter().take(2).enumerate() {
-        frame.render_widget(Paragraph::new(line), header_rows[2 + index]);
+    for (index, line) in usage.iter().enumerate() {
+        frame.render_widget(Paragraph::new(line.as_str()), header_rows[2 + index]);
     }
     frame.render_widget(
         Paragraph::new(format!(
             "Updated: {}  •  Auto-refresh {}ms",
             last_refresh, REFRESH_INTERVAL_MS
         )),
-        header_rows[4],
+        header_rows[2 + usage.len()],
     );
 }
 
 fn provider_title(provider: &str) -> &'static str {
     match provider {
+        "claude" => "Claude Agent Monitor",
         "kiro" => "Kiro Agent Monitor",
-        "all" => "Codex + Kiro Monitor",
+        "ollama" => "Ollama Agent Monitor",
+        "all" => "Codex + Claude + Kiro (Ollama)",
         _ => "Codex Agent Monitor",
     }
+}
+
+/// Sums the Claude rows currently in view. Claude Code persists no account
+/// allowance, so the header reports observed tokens rather than a quota.
+fn claude_token_summary(rows: &[ListRow]) -> (u64, usize) {
+    rows.iter()
+        .filter(|row| row.source_kind == "claude_code")
+        .fold((0_u64, 0_usize), |(tokens, sessions), row| {
+            (
+                tokens.saturating_add(row.token_total_value.unwrap_or(0)),
+                sessions + 1,
+            )
+        })
+}
+
+/// Claude Code's desktop app records plan utilisation percentages but no reset
+/// time, so the line reports the windows it has plus observed token totals.
+fn claude_usage_line(
+    account_usage: &Observed<AccountUsage>,
+    tokens: u64,
+    sessions: usize,
+    now: DateTime<Utc>,
+) -> String {
+    let mut windows = Vec::new();
+    if let Some(usage) = account_usage.value.as_ref() {
+        for window in [usage.primary.as_ref(), usage.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            windows.push(account_usage_window_label(window, now));
+        }
+    }
+    let plan = if windows.is_empty() {
+        "unavailable".to_string()
+    } else {
+        windows.join(" · ")
+    };
+    let observed = if sessions == 0 {
+        "no sessions observed".to_string()
+    } else {
+        format!(
+            "{} tokens · {} session{}",
+            format_compact_count(tokens),
+            sessions,
+            if sessions == 1 { "" } else { "s" }
+        )
+    };
+    format!("Claude usage: {plan}  •  {observed}")
 }
 
 fn usage_lines(
     provider: &str,
     account_usage: &Observed<AccountUsage>,
     kiro_account_usage: &Observed<KiroAccountUsage>,
+    ollama_server: &OllamaServerStatus,
+    claude_account_usage: &Observed<AccountUsage>,
+    claude_tokens: (u64, usize),
     now: DateTime<Utc>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    if matches!(provider, "ollama" | "all") {
+        let status = if ollama_server.available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        let models = if ollama_server.loaded_models.is_empty() {
+            "none".to_string()
+        } else {
+            let mut models = ollama_server.loaded_models.join(", ");
+            if models.len() > 72 {
+                models.truncate(69);
+                models.push_str("...");
+            }
+            models
+        };
+        lines.push(format!("Ollama API: {status}  •  models: {models}"));
+    }
     if matches!(provider, "codex" | "all") {
         lines.push(account_usage_line("Codex usage", account_usage, now));
+    }
+    if matches!(provider, "claude" | "all") {
+        lines.push(claude_usage_line(
+            claude_account_usage,
+            claude_tokens.0,
+            claude_tokens.1,
+            now,
+        ));
     }
     if matches!(provider, "kiro" | "all") {
         lines.push(kiro_account_usage_line(kiro_account_usage, now));
@@ -1225,6 +1310,11 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
         model,
         effort,
         token_total: token_total_label(&thread.token_usage),
+        token_total_value: thread
+            .token_usage
+            .value
+            .as_ref()
+            .and_then(|usage| usage.total_tokens),
         context_usage: context_usage_card_label(&thread.context_usage),
         task_progress: task_progress_card_label(&thread.task_progress),
         origin_label,
@@ -1385,7 +1475,11 @@ fn matches_filter_query(row: &ListRow, query: &str) -> bool {
 }
 
 fn provider_for_source_kind(source_kind: Option<&str>) -> String {
-    if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
+    if matches!(source_kind, Some("ollama_desktop") | Some("ollama_cli")) {
+        "Ollama".to_string()
+    } else if matches!(source_kind, Some("claude_code")) {
+        "Claude".to_string()
+    } else if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
         "Kiro".to_string()
     } else {
         "Codex".to_string()
@@ -1394,6 +1488,9 @@ fn provider_for_source_kind(source_kind: Option<&str>) -> String {
 
 fn friendly_source_kind(source_kind: &str) -> &str {
     match source_kind {
+        "ollama_desktop" => "Ollama Desktop",
+        "ollama_cli" => "Ollama CLI",
+        "claude_code" => "Claude Code",
         "kiro_cli" => "Kiro CLI",
         "kiro_acp" => "Kiro ACP worker",
         _ => "Codex",
@@ -2087,6 +2184,8 @@ mod tests {
                         },
                         account_usage: &Observed::unknown(),
                         kiro_account_usage: &Observed::unknown(),
+                        claude_account_usage: &Observed::unknown(),
+                        ollama_server: &OllamaServerStatus::default(),
                         provider: "codex",
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
@@ -2277,6 +2376,8 @@ mod tests {
                         },
                         account_usage: &Observed::unknown(),
                         kiro_account_usage: &Observed::unknown(),
+                        claude_account_usage: &Observed::unknown(),
+                        ollama_server: &OllamaServerStatus::default(),
                         provider: "codex",
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
@@ -2356,6 +2457,8 @@ mod tests {
                             },
                             account_usage: &account_usage,
                             kiro_account_usage: &Observed::unknown(),
+                            claude_account_usage: &Observed::unknown(),
+                            ollama_server: &OllamaServerStatus::default(),
                             provider: "codex",
                             selected: 0,
                             state_filter: &LocalStateFilter::All,
@@ -2467,6 +2570,8 @@ mod tests {
                         },
                         account_usage: &Observed::unknown(),
                         kiro_account_usage: &Observed::unknown(),
+                        claude_account_usage: &Observed::unknown(),
+                        ollama_server: &OllamaServerStatus::default(),
                         provider: "codex",
                         selected: 0,
                         state_filter: &LocalStateFilter::All,
@@ -2706,6 +2811,122 @@ mod tests {
         assert!(!matches_filter_query(&row, "does-not-exist"));
     }
 
+    fn claude_row(id: &str, total: Option<u64>) -> ListRow {
+        let mut thread = make_snapshot(
+            id,
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        thread.source_kind = Some("claude_code".to_string());
+        thread.token_usage = Observed::from_value(
+            total.map(|total| TokenUsage {
+                input_tokens: None,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                output_tokens: None,
+                reasoning_output_tokens: None,
+                total_tokens: Some(total),
+                context_window: None,
+            }),
+            "claude_code.transcript",
+            None,
+            None,
+        );
+        build_list_row(&thread, 0, Utc::now())
+    }
+
+    #[test]
+    fn claude_header_aggregates_tokens_across_sessions() {
+        let rows = vec![
+            claude_row("claude:a", Some(10_000_000)),
+            claude_row("claude:b", Some(1_500_000)),
+        ];
+        assert_eq!(claude_token_summary(&rows), (11_500_000, 2));
+        let plan = Observed::from_value(
+            Some(AccountUsage {
+                primary: Some(AccountUsageWindow {
+                    used_percent: Some(20.0),
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(AccountUsageWindow {
+                    used_percent: Some(3.0),
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+            }),
+            "claude.plan_usage_history",
+            None,
+            None,
+        );
+        // The shared formatter reports remaining, so 20% used renders as 80%.
+        let line = claude_usage_line(&plan, 11_500_000, 2, Utc::now());
+        assert!(line.contains("5h 80%"), "{line}");
+        assert!(line.contains("Weekly 97%"), "{line}");
+        assert!(line.contains("2 sessions"), "{line}");
+
+        // A session without usage evidence still counts as a session, adding zero
+        // rather than dropping the row or inventing a total.
+        let mixed = vec![
+            claude_row("claude:a", Some(4_000)),
+            claude_row("claude:b", None),
+        ];
+        assert_eq!(claude_token_summary(&mixed), (4_000, 2));
+
+        // Rows from other providers are excluded.
+        let codex = make_snapshot(
+            "codex-1",
+            None,
+            None,
+            None,
+            ThreadState::Running,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let codex_rows = vec![build_list_row(&codex, 0, Utc::now())];
+        assert_eq!(claude_token_summary(&codex_rows), (0, 0));
+        // With no plan history and no sessions, both halves say so plainly.
+        let empty = claude_usage_line(&Observed::unknown(), 0, 0, Utc::now());
+        assert_eq!(empty, "Claude usage: unavailable  •  no sessions observed");
+
+        let single = claude_usage_line(&Observed::unknown(), 5, 1, Utc::now());
+        assert!(single.contains("1 session") && !single.contains("1 sessions"));
+    }
+
+    #[test]
+    fn claude_rows_are_labeled_and_searchable_by_provider() {
+        let mut thread = make_snapshot(
+            "claude:48201b28",
+            Some("Claude Code @ main"),
+            Some("claude-desktop"),
+            None,
+            ThreadState::Running,
+            Some("running"),
+            Some("/Users/someone/repo"),
+            None,
+            Some(("claude-opus-5", "high")),
+            None,
+        );
+        thread.source_kind = Some("claude_code".to_string());
+        let row = build_list_row(&thread, 0, Utc::now());
+        assert_eq!(row.provider_label, "Claude");
+        assert!(matches_filter_query(&row, "claude"));
+        assert!(matches_filter_query(&row, "48201b28"));
+        assert!(!matches_filter_query(&row, "codex"));
+        assert_eq!(friendly_source_kind("claude_code"), "Claude Code");
+        assert_eq!(provider_title("claude"), "Claude Agent Monitor");
+    }
+
     #[test]
     fn tui_card_shows_kiro_source_kind_without_changing_card_height() {
         let mut snapshot = make_snapshot(
@@ -2786,6 +3007,11 @@ mod tests {
             confidence: Confidence::Medium,
             detail: None,
         };
+        let ollama_server = OllamaServerStatus {
+            available: true,
+            loaded_models: vec!["llama3.2:latest".to_string()],
+            detail: None,
+        };
         for width in [70, 80, 100, 120] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
@@ -2804,6 +3030,8 @@ mod tests {
                             },
                             account_usage: &codex_usage,
                             kiro_account_usage: &kiro_usage,
+                            claude_account_usage: &Observed::unknown(),
+                            ollama_server: &ollama_server,
                             provider: "all",
                             selected: 0,
                             state_filter: &LocalStateFilter::All,
@@ -2826,9 +3054,11 @@ mod tests {
                 .collect();
             assert!(rendered.contains("Codex usage:"), "width {width}");
             assert!(rendered.contains("Kiro credits:"), "width {width}");
+            assert!(rendered.contains("llama3.2:latest"), "width {width}");
             assert!(rendered.contains("800.33"), "width {width}");
             assert!(rendered.contains("1000.00"), "width {width}");
-            assert!(rendered.contains("Codex + Kiro Monitor"), "width {width}");
+            assert!(rendered.contains("Codex + Claude + Kiro"), "width {width}");
+            assert!(rendered.contains("Claude usage:"), "width {width}");
         }
     }
 

@@ -327,7 +327,11 @@ pub struct ProbeOutput {
     #[serde(default)]
     pub account_usage: Observed<AccountUsage>,
     #[serde(default)]
+    pub claude_account_usage: Observed<AccountUsage>,
+    #[serde(default)]
     pub kiro_account_usage: Observed<KiroAccountUsage>,
+    #[serde(default)]
+    pub ollama_server: crate::ollama::OllamaServerStatus,
     pub threads: Vec<ThreadSnapshot>,
     pub tree: Vec<ThreadTreeNode>,
 }

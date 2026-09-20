@@ -541,6 +541,36 @@ fn native_tool_activity_keeps_names_statuses_and_stream_order_only() {
 }
 
 #[test]
+fn native_event_reader_skips_large_ignored_payloads() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join("sessions/cli/large-payload.json"),
+        r#"{"session_id":"large-payload","cwd":"/work/large","session_state":{"agent_name":"default"}}"#,
+    );
+    let large_array = format!("{}0", "0,".repeat(2_000_000));
+    write(
+        &temp.path().join("sessions/cli/large-payload.jsonl"),
+        &format!(
+            "{{\"version\":1,\"kind\":\"Prompt\",\"data\":{{\"meta\":{{\"timestamp\":1789210800}},\"content\":[{{\"kind\":\"text\",\"data\":{{\"source\":{{\"data\":[{}]}}}}}}]}}}}\n",
+            large_array
+        ),
+    );
+
+    let snapshot = probe_fixture(temp.path());
+    let activity = &snapshot.recent_activity;
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].kind, "prompt");
+    assert_eq!(
+        activity[0].timestamp,
+        Some(
+            "2026-09-12T11:00:00Z"
+                .parse::<chrono::DateTime<Utc>>()
+                .unwrap()
+        )
+    );
+}
+
+#[test]
 fn task_store_without_valid_tasks_is_not_reported() {
     let temp = tempfile::tempdir().unwrap();
     write(

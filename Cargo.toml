@@ -1,6 +1,6 @@
 [package]
 name = "codex-agent-monitor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -13,7 +13,7 @@ libc = "0.2"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 toml = "0.8"
 
 [dev-dependencies]

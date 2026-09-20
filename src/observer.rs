@@ -9,6 +9,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::process::Command;
 
+use crate::claude::{self, ClaudeThreadRecord};
 use crate::cli::{FilterOpts, Provider, ThreadStateFilter};
 use crate::config::{
     load_agent_config_value, load_config, resolve_codex_home, sqlite_home, SqliteHome,
@@ -22,6 +23,7 @@ use crate::model::{
     ProbeOutput, QueryInfo, TaskProgress, ThreadActivity, ThreadEvidence, ThreadSnapshot,
     ThreadState, TokenUsage,
 };
+use crate::ollama::{self, OllamaServerStatus, OllamaThreadRecord};
 use crate::rollout::{
     RolloutParseResult, RolloutStateHint, RolloutTerminalEvent, RolloutTerminalObservation,
 };
@@ -32,6 +34,9 @@ pub struct Monitor {
     pub codex_home: PathBuf,
     pub kiro_home: PathBuf,
     pub kiro_db: Option<PathBuf>,
+    pub ollama_db: Option<PathBuf>,
+    pub claude_home: PathBuf,
+    pub claude_usage_file: Option<PathBuf>,
     kiro_home_explicit: bool,
     pub provider: Provider,
     pub config: crate::config::ConfigContext,
@@ -39,6 +44,8 @@ pub struct Monitor {
     rollout_cache: HashMap<PathBuf, CachedRollout>,
     startup_warnings: Vec<String>,
     kiro_usage: KiroUsageState,
+    kiro_event_buffer: String,
+    ollama_server: OllamaServerStatus,
 }
 
 #[derive(Debug)]
@@ -218,11 +225,35 @@ impl Monitor {
         kiro_cli: Option<String>,
         no_kiro_usage: bool,
     ) -> Result<Self> {
+        Self::new_with_sources_and_usage_and_ollama(
+            override_home,
+            kiro_home,
+            kiro_db,
+            provider,
+            kiro_cli,
+            no_kiro_usage,
+            None,
+        )
+    }
+
+    pub fn new_with_sources_and_usage_and_ollama(
+        override_home: Option<String>,
+        kiro_home: Option<String>,
+        kiro_db: Option<String>,
+        provider: Provider,
+        kiro_cli: Option<String>,
+        no_kiro_usage: bool,
+        ollama_db: Option<String>,
+    ) -> Result<Self> {
         let home = resolve_codex_home(override_home.as_deref())?;
         let (resolved_kiro_home, kiro_home_explicit) =
             kiro::resolve_kiro_home(kiro_home.as_deref())?;
+        let (resolved_claude_home, _) = claude::resolve_claude_home(None)?;
         let mut startup_warnings = Vec::new();
-        let config = if matches!(provider, Provider::Kiro) {
+        let config = if matches!(
+            provider,
+            Provider::Claude | Provider::Kiro | Provider::Ollama
+        ) {
             crate::config::ConfigContext {
                 global: None,
                 agents_dir: None,
@@ -268,14 +299,32 @@ impl Monitor {
             codex_home: home,
             kiro_home: resolved_kiro_home,
             kiro_db,
+            ollama_db: ollama_db.map(PathBuf::from),
+            claude_home: resolved_claude_home,
+            claude_usage_file: None,
             kiro_home_explicit,
             provider: provider.clone(),
             config,
-            environment: detect_environment(!matches!(provider, Provider::Kiro)),
+            environment: detect_environment(!matches!(
+                provider,
+                Provider::Claude | Provider::Kiro | Provider::Ollama
+            )),
             rollout_cache: HashMap::new(),
             startup_warnings,
             kiro_usage: KiroUsageState::new(usage_client, usage_enabled, disabled_reason),
+            kiro_event_buffer: String::new(),
+            ollama_server: OllamaServerStatus::default(),
         })
+    }
+
+    pub fn set_claude_home(&mut self, claude_home: Option<String>) -> Result<()> {
+        let (home, _) = claude::resolve_claude_home(claude_home.as_deref())?;
+        self.claude_home = home;
+        Ok(())
+    }
+
+    pub fn set_claude_usage_file(&mut self, path: Option<String>) {
+        self.claude_usage_file = path.map(PathBuf::from);
     }
 
     pub fn probe_snapshot(
@@ -306,6 +355,7 @@ impl Monitor {
         let mut db_threads = Vec::new();
         let mut parent_edges = Vec::new();
         let mut warnings = self.startup_warnings.clone();
+        let mut rollouts: HashMap<String, RolloutParseResult> = HashMap::new();
         if matches!(self.provider, Provider::Codex | Provider::All) {
             let sqlite_root = sqlite_home(&self.codex_home, &self.config);
             let db_path = match sqlite_root {
@@ -324,15 +374,54 @@ impl Monitor {
                 Err(err) => return Err(err),
             }
         }
-        let mut rollouts: HashMap<String, RolloutParseResult> = HashMap::new();
+        if matches!(self.provider, Provider::Ollama | Provider::All) {
+            let ollama_snapshot = ollama::read_snapshot(self.ollama_db.as_deref());
+            warnings.extend(ollama_snapshot.warnings);
+            for thread in ollama_snapshot.threads {
+                if db_threads.iter().any(|existing| existing.id == thread.id) {
+                    continue;
+                }
+                let id = thread.id.clone();
+                rollouts.insert(id.clone(), ollama_rollout(&thread));
+                db_threads.push(ollama_db_record(&thread));
+            }
+            let cli_snapshot = ollama::read_cli_processes();
+            warnings.extend(cli_snapshot.warnings);
+            for thread in cli_snapshot.threads {
+                if db_threads.iter().any(|existing| existing.id == thread.id) {
+                    continue;
+                }
+                let id = thread.id.clone();
+                rollouts.insert(id.clone(), ollama_rollout(&thread));
+                db_threads.push(ollama_db_record(&thread));
+            }
+            self.ollama_server = ollama::poll_server();
+        }
+        let mut claude_paths = HashMap::<String, PathBuf>::new();
+        let mut claude_account_usage = Observed::<AccountUsage>::unknown();
+        if matches!(self.provider, Provider::Claude | Provider::All) {
+            claude_account_usage = claude::read_plan_usage(self.claude_usage_file.as_deref());
+            let claude_snapshot = claude::read_snapshot(&self.claude_home);
+            warnings.extend(claude_snapshot.warnings);
+            for thread in claude_snapshot.threads {
+                let id = thread.id.clone();
+                if db_threads.iter().any(|existing| existing.id == id) {
+                    continue;
+                }
+                claude_paths.extend(thread.path.clone().map(|path| (id.clone(), path)));
+                rollouts.insert(id.clone(), claude_rollout(&thread));
+                db_threads.push(claude_db_record(&thread));
+            }
+        }
         let mut kiro_paths = HashMap::<String, PathBuf>::new();
         let mut kiro_context_usage = HashMap::<String, Observed<ContextUsage>>::new();
         let mut kiro_task_progress = HashMap::<String, Observed<TaskProgress>>::new();
         if matches!(self.provider, Provider::Kiro | Provider::All) {
-            let kiro_snapshot = kiro::read_snapshot(
+            let kiro_snapshot = kiro::read_snapshot_with_buffer(
                 &self.kiro_home,
                 self.kiro_db.as_deref(),
                 self.kiro_home_explicit,
+                &mut self.kiro_event_buffer,
             );
             warnings.extend(kiro_snapshot.warnings);
             for kiro_thread in kiro_snapshot.threads {
@@ -591,7 +680,12 @@ impl Monitor {
                     .rollout_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .or_else(|| kiro_paths.get(&thread.id).map(|p| p.display().to_string())),
+                    .or_else(|| kiro_paths.get(&thread.id).map(|p| p.display().to_string()))
+                    .or_else(|| {
+                        claude_paths
+                            .get(&thread.id)
+                            .map(|p| p.display().to_string())
+                    }),
                 warnings: Vec::new(),
                 recent_activity: activity,
                 evidence,
@@ -644,7 +738,9 @@ impl Monitor {
                 provider: Some(
                     match self.provider {
                         Provider::Codex => "codex",
+                        Provider::Claude => "claude",
                         Provider::Kiro => "kiro",
+                        Provider::Ollama => "ollama",
                         Provider::All => "all",
                     }
                     .to_string(),
@@ -652,7 +748,9 @@ impl Monitor {
             },
             warnings: combined_warnings,
             account_usage,
+            claude_account_usage,
             kiro_account_usage,
+            ollama_server: self.ollama_server.clone(),
             threads: thread_rows,
             tree,
         })
@@ -676,6 +774,93 @@ fn kiro_db_record(thread: &KiroThreadRecord) -> crate::db::DbThreadRecord {
         cwd: thread.cwd.clone(),
         source_kind: Some(thread.source_kind.clone()),
         raw: HashMap::new(),
+    }
+}
+
+fn ollama_db_record(thread: &OllamaThreadRecord) -> crate::db::DbThreadRecord {
+    crate::db::DbThreadRecord {
+        id: thread.id.clone(),
+        rollout_path: None,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+        recency_at: thread.recency_at,
+        source: None,
+        thread_source: None,
+        model: thread.model.clone(),
+        reasoning_effort: None,
+        agent_nickname: thread.nickname.clone(),
+        agent_role: None,
+        agent_path: None,
+        cwd: None,
+        source_kind: Some(thread.source_kind.clone()),
+        raw: HashMap::new(),
+    }
+}
+
+fn claude_db_record(thread: &ClaudeThreadRecord) -> crate::db::DbThreadRecord {
+    crate::db::DbThreadRecord {
+        id: thread.id.clone(),
+        rollout_path: None,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+        recency_at: thread.recency_at,
+        source: None,
+        thread_source: None,
+        model: thread.model.clone(),
+        reasoning_effort: thread.effort.clone(),
+        agent_nickname: thread.nickname.clone(),
+        agent_role: thread.role.clone(),
+        agent_path: None,
+        cwd: thread.cwd.clone(),
+        source_kind: Some(thread.source_kind.clone()),
+        raw: HashMap::new(),
+    }
+}
+
+fn claude_rollout(thread: &ClaudeThreadRecord) -> RolloutParseResult {
+    let final_state = match thread.state {
+        ThreadState::Running => RolloutStateHint::Running,
+        ThreadState::Idle => RolloutStateHint::TurnCompleted,
+        ThreadState::Unknown => RolloutStateHint::Unknown,
+    };
+    let terminal = thread
+        .terminal
+        .map(|(event, observed_at)| RolloutTerminalObservation { event, observed_at });
+    let latest_activity_at = thread.activity.iter().filter_map(|item| item.ts).max();
+    RolloutParseResult {
+        warnings: thread.warnings.clone(),
+        requested_model: if thread.model.is_some() || thread.effort.is_some() {
+            Some(crate::rollout::RolloutModelObservation {
+                model: thread.model.clone(),
+                effort: thread.effort.clone(),
+                source: "claude_code.transcript".to_string(),
+                observed_at: thread.updated_at,
+            })
+        } else {
+            None
+        },
+        token_usage: thread.token_usage.clone(),
+        activity: thread.activity.clone(),
+        final_state,
+        last_terminal_event: terminal,
+        final_state_at: thread.lifecycle_at,
+        latest_lifecycle_at: thread.lifecycle_at,
+        latest_activity_at,
+        ..RolloutParseResult::default()
+    }
+}
+
+fn ollama_rollout(thread: &OllamaThreadRecord) -> RolloutParseResult {
+    let final_state = match thread.state {
+        ThreadState::Running => RolloutStateHint::Running,
+        ThreadState::Idle => RolloutStateHint::TurnCompleted,
+        ThreadState::Unknown => RolloutStateHint::Unknown,
+    };
+    RolloutParseResult {
+        final_state,
+        latest_lifecycle_at: thread.activity_at,
+        latest_activity_at: thread.activity_at,
+        ..RolloutParseResult::default()
     }
 }
 
@@ -716,7 +901,10 @@ fn kiro_rollout(thread: &KiroThreadRecord) -> RolloutParseResult {
 }
 
 fn thread_id_matches(id: &str, filter: &str) -> bool {
-    id == filter || id.strip_prefix("kiro:").is_some_and(|raw| raw == filter)
+    id == filter
+        || id.strip_prefix("kiro:").is_some_and(|raw| raw == filter)
+        || id.strip_prefix("ollama:").is_some_and(|raw| raw == filter)
+        || id.strip_prefix("claude:").is_some_and(|raw| raw == filter)
 }
 
 fn account_usage_observation(
@@ -1442,6 +1630,11 @@ fn requested_model(
         });
 
     if let Some((model_name, reasoning_effort, source, observed_at)) = model {
+        let model_name = if thread_uses_ollama(thread) {
+            model_name.map(|model| format!("{model} via Ollama"))
+        } else {
+            model_name
+        };
         Observed {
             value: Some(ModelSpec {
                 model: model_name,
@@ -1462,6 +1655,19 @@ fn requested_model(
     } else {
         Observed::unknown()
     }
+}
+
+fn thread_uses_ollama(thread: &crate::db::DbThreadRecord) -> bool {
+    thread
+        .raw
+        .iter()
+        .any(|(key, value)| key.eq_ignore_ascii_case("model_provider") && value_is_ollama(value))
+}
+
+fn value_is_ollama(value: &serde_json::Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|provider| provider.to_ascii_lowercase().starts_with("ollama"))
 }
 
 fn thread_project(thread: &crate::db::DbThreadRecord) -> Option<String> {
@@ -1842,6 +2048,21 @@ mod tests {
     }
 
     #[test]
+    fn ollama_launch_provider_is_annotated_without_changing_source() {
+        let mut thread = test_thread();
+        thread.model = Some("llama3.2".into());
+        thread
+            .raw
+            .insert("model_provider".into(), serde_json::json!("ollama-launch"));
+        let observed = requested_model(&thread, None);
+        assert_eq!(
+            observed.value.unwrap().model.as_deref(),
+            Some("llama3.2 via Ollama")
+        );
+        assert!(thread_uses_ollama(&thread));
+    }
+
+    #[test]
     fn requested_model_uses_db_fallback_when_no_rollout_model() {
         let thread = crate::db::DbThreadRecord {
             id: "t2".into(),
@@ -2008,6 +2229,8 @@ mod tests {
             warnings: vec![],
             account_usage: Observed::unknown(),
             kiro_account_usage: Observed::unknown(),
+            claude_account_usage: Observed::unknown(),
+            ollama_server: OllamaServerStatus::default(),
             threads: vec![snapshot],
             tree: Vec::new(),
         };

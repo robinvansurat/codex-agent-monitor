@@ -15,14 +15,17 @@ use serde_json::to_string_pretty;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut monitor = Monitor::new_with_sources_and_usage(
+    let mut monitor = Monitor::new_with_sources_and_usage_and_ollama(
         cli.codex_home.clone(),
         cli.shared.kiro_home.clone(),
         cli.shared.kiro_db.clone(),
         cli.shared.provider.clone(),
         cli.shared.kiro_cli.clone(),
         cli.shared.no_kiro_usage,
+        cli.shared.ollama_db.clone(),
     )?;
+    monitor.set_claude_home(cli.shared.claude_home.clone())?;
+    monitor.set_claude_usage_file(cli.shared.claude_usage_file.clone());
     let command = selected_command(&cli);
 
     match command {

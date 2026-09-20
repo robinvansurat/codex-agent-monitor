@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "codex-agent-monitor")]
-#[command(about = "Inspect Codex and Kiro thread activity from persisted state")]
+#[command(about = "Inspect Codex, Claude, Kiro, and Ollama thread activity from persisted state")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -23,6 +23,12 @@ pub struct SharedArgs {
     pub kiro_home: Option<String>,
     #[arg(long, global = true)]
     pub kiro_db: Option<String>,
+    #[arg(long, global = true)]
+    pub ollama_db: Option<String>,
+    #[arg(long, global = true, env = "CLAUDE_CONFIG_DIR")]
+    pub claude_home: Option<String>,
+    #[arg(long, global = true)]
+    pub claude_usage_file: Option<String>,
     #[arg(long, global = true)]
     pub kiro_cli: Option<String>,
     #[arg(long, global = true)]
@@ -68,7 +74,9 @@ pub enum OutputFormat {
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Provider {
     Codex,
+    Claude,
     Kiro,
+    Ollama,
     #[default]
     All,
 }
@@ -232,5 +240,36 @@ mod tests {
         let codex_cli = Cli::try_parse_from(["codex-agent-monitor", "--provider", "codex"])
             .expect("parse explicit Codex provider");
         assert_eq!(merge_tui_args(&codex_cli).provider, Provider::Codex);
+
+        let ollama_cli = Cli::try_parse_from([
+            "codex-agent-monitor",
+            "--provider",
+            "ollama",
+            "--ollama-db",
+            "/tmp/ollama.sqlite",
+            "--kiro-cli",
+            "/tmp/kiro-cli",
+        ])
+        .expect("parse Ollama and Kiro options");
+        assert_eq!(merge_tui_args(&ollama_cli).provider, Provider::Ollama);
+        assert_eq!(
+            ollama_cli.shared.ollama_db.as_deref(),
+            Some("/tmp/ollama.sqlite")
+        );
+        assert_eq!(ollama_cli.shared.kiro_cli.as_deref(), Some("/tmp/kiro-cli"));
+
+        let claude_cli = Cli::try_parse_from([
+            "codex-agent-monitor",
+            "--provider",
+            "claude",
+            "--claude-home",
+            "/tmp/claude",
+        ])
+        .expect("parse Claude options");
+        assert_eq!(merge_tui_args(&claude_cli).provider, Provider::Claude);
+        assert_eq!(
+            claude_cli.shared.claude_home.as_deref(),
+            Some("/tmp/claude")
+        );
     }
 }
