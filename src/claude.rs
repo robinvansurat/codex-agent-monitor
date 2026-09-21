@@ -57,6 +57,19 @@ pub struct ClaudeSnapshot {
 struct LiveSession {
     cwd: Option<String>,
     entrypoint: Option<String>,
+    /// `busy` | `shell` | `idle` | `waiting`, as published by the CLI itself.
+    /// Absent on versions that do not record it.
+    status: Option<String>,
+}
+
+/// A live process is not the same as an in-flight turn: a session that finished
+/// its turn keeps its registry entry while it waits at the prompt.
+fn state_for_live_status(status: &str) -> Option<ThreadState> {
+    match status {
+        "busy" | "shell" | "waiting" => Some(ThreadState::Running),
+        "idle" => Some(ThreadState::Idle),
+        _ => None,
+    }
 }
 
 pub fn resolve_claude_home(cli_home: Option<&str>) -> Result<(PathBuf, bool)> {
@@ -180,6 +193,7 @@ fn read_live_sessions(dir: &Path, warnings: &mut Vec<String>) -> HashMap<String,
             LiveSession {
                 cwd: string_field(&value, "cwd"),
                 entrypoint: string_field(&value, "entrypoint"),
+                status: string_field(&value, "status"),
             },
         );
     }
@@ -246,6 +260,9 @@ struct TranscriptAccumulator {
     activity: VecDeque<RolloutActivity>,
     counted_messages: HashSet<String>,
     usage: TokenTotals,
+    /// Whether the last non-sidechain record left the session's own turn
+    /// in flight. Used when the registry publishes no status.
+    turn_open: bool,
     saw_record: bool,
     malformed: usize,
     warnings: Vec<String>,
@@ -294,7 +311,7 @@ impl TranscriptAccumulator {
         }
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => self.ingest_assistant(value, ts, is_sidechain),
-            Some("user") => self.ingest_user(value, ts),
+            Some("user") => self.ingest_user(value, ts, is_sidechain),
             Some("system") => self.push_activity(RolloutActivity {
                 kind: "system".to_string(),
                 tool_name: None,
@@ -330,6 +347,10 @@ impl TranscriptAccumulator {
         if stop_reason.as_deref() == Some("end_turn") {
             self.terminal = Some((RolloutTerminalEvent::Completed, ts));
         }
+        // A subagent ending its turn says nothing about the parent session.
+        if !is_sidechain {
+            self.turn_open = stop_reason.as_deref() != Some("end_turn");
+        }
         self.push_activity(RolloutActivity {
             kind: "assistant_message".to_string(),
             tool_name: None,
@@ -348,10 +369,13 @@ impl TranscriptAccumulator {
         }
     }
 
-    fn ingest_user(&mut self, value: &Value, ts: Option<DateTime<Utc>>) {
+    fn ingest_user(&mut self, value: &Value, ts: Option<DateTime<Utc>>, is_sidechain: bool) {
         let Some(message) = value.get("message") else {
             return;
         };
+        if !is_sidechain {
+            self.turn_open = true;
+        }
         let mut tool_results = 0_usize;
         for block in content_blocks(message) {
             if block.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -393,12 +417,21 @@ impl TranscriptAccumulator {
         live: &HashMap<String, LiveSession>,
     ) -> ClaudeThreadRecord {
         let live_session = live.get(&session_id);
-        let state = if live_session.is_some() {
+        let transcript_state = if self.turn_open {
             ThreadState::Running
         } else if self.saw_record {
             ThreadState::Idle
         } else {
             ThreadState::Unknown
+        };
+        let state = match live_session {
+            Some(session) => session
+                .status
+                .as_deref()
+                .and_then(state_for_live_status)
+                .unwrap_or(transcript_state),
+            None if self.saw_record => ThreadState::Idle,
+            None => ThreadState::Unknown,
         };
         let recency_at = self.last_at;
         ClaudeThreadRecord {

@@ -208,7 +208,8 @@ fn running_requires_a_live_registered_process() {
         ThreadState::Idle
     );
 
-    // The test process itself is visible, so the session counts as running.
+    // The test process itself is visible, and the fixture transcript ends with a
+    // tool result, so its own turn is still in flight.
     let pid = std::process::id();
     fs::write(
         sessions.join(format!("{pid}.json")),
@@ -219,6 +220,74 @@ fn running_requires_a_live_registered_process() {
     assert_eq!(
         read_snapshot(temp.path()).threads[0].state,
         ThreadState::Running
+    );
+}
+
+#[test]
+fn a_live_process_waiting_at_the_prompt_is_not_running() {
+    let temp = fixture();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let pid = std::process::id();
+    let registry = sessions.join(format!("{pid}.json"));
+    let entry = |status: Option<&str>| {
+        let mut value = serde_json::json!({ "pid": pid, "sessionId": SESSION });
+        if let Some(status) = status {
+            value["status"] = serde_json::json!(status);
+        }
+        value.to_string()
+    };
+
+    // The CLI publishes its own status; a finished turn leaves the process alive.
+    for status in ["busy", "shell", "waiting"] {
+        fs::write(&registry, entry(Some(status))).unwrap();
+        assert_eq!(
+            read_snapshot(temp.path()).threads[0].state,
+            ThreadState::Running,
+            "status {status}"
+        );
+    }
+    fs::write(&registry, entry(Some("idle"))).unwrap();
+    assert_eq!(
+        read_snapshot(temp.path()).threads[0].state,
+        ThreadState::Idle
+    );
+
+    // Without a published status the transcript decides: the last own-turn
+    // record here is an assistant message that ended its turn.
+    let mut lines = vec![serde_json::json!({
+        "type": "user",
+        "sessionId": SESSION,
+        "timestamp": "2026-09-20T10:00:00.000Z",
+        "cwd": "/Users/someone/repo",
+        "message": { "role": "user", "content": [{ "type": "text", "text": "SECRET_PROMPT" }] }
+    })
+    .to_string()];
+    lines.extend(response_records(
+        "msg_main",
+        "2026-09-20T10:00:05.000Z",
+        40,
+        false,
+    ));
+    // A subagent ending its own turn must not settle the parent session.
+    lines.extend(response_records(
+        "msg_sub",
+        "2026-09-20T10:00:06.000Z",
+        7,
+        true,
+    ));
+    write_transcript(temp.path(), SESSION, &lines);
+    fs::write(&registry, entry(None)).unwrap();
+    assert_eq!(
+        read_snapshot(temp.path()).threads[0].state,
+        ThreadState::Idle
+    );
+
+    // An unrecognised status falls back to the same transcript evidence.
+    fs::write(&registry, entry(Some("teleporting"))).unwrap();
+    assert_eq!(
+        read_snapshot(temp.path()).threads[0].state,
+        ThreadState::Idle
     );
 }
 
