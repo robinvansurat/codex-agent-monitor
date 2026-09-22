@@ -30,7 +30,8 @@ It is **not**:
 - Claude Code CLI session inspection with `--provider claude` or `--provider all`, including per-session cumulative token counters and live-process state
 - Kiro CLI and ACP session inspection with `--provider kiro` or `--provider all`
 - Ollama Desktop chat metadata with `--provider ollama` or `--provider all`; local Ollama API availability and loaded model names are reported when reachable
-- Live `ollama run <model>` process rows with safe model/PID telemetry; Desktop chats remain persisted history and API models remain status-only
+- Live `ollama run <model>` process rows with safe model/PID telemetry, plus a running row per model resident in the local Ollama API (`ollama:api:<model>`), labeled as keep-alive residency rather than a confirmed in-flight request
+- `--provider ollama` also returns Codex threads whose persisted `model_provider` is an Ollama backend, shown as `<model> via Ollama`
 - Kiro native task progress (numeric task IDs and normalized statuses only) plus safe native tool call/result activity
 
 ## Install/build
@@ -62,7 +63,7 @@ Commands:
 
 Global/command options include:
 
-- `--provider {codex,claude,kiro,ollama,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode)
+- `--provider {codex,claude,kiro,ollama,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode). `--provider ollama` covers both Ollama's own sources and threads of other providers running on an Ollama backend
 - `--claude-home <path>` (or `CLAUDE_CONFIG_DIR`): Claude Code home to inspect; defaults to `~/.claude`
 - `--claude-usage-file <path>`: explicit Claude plan utilisation history; otherwise the Claude desktop app's `plan-usage-history.json` is used
 - `--kiro-home <path>` (or `KIRO_HOME`): Kiro home to inspect; defaults to `~/.kiro`

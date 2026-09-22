@@ -78,14 +78,24 @@ to 500 rows, and never selects titles, prompts, responses, thinking, or
 tool-content columns. Missing schemas produce warnings and no rows. Chat state
 is `running` only for a recent unfinished thinking interval, `idle` for
 persisted message activity, and `unknown` for empty chats or missing evidence.
-Loaded models from `/api/ps` are server observations and do not create agent
-rows or imply a running chat.
+Loaded models from `/api/ps` also produce one row per resident model
+(`ollama:api:<model>`, source kind `ollama_api`, state `running`). Residency is
+keep-alive evidence that the model was used recently by some local client; it is
+not proof of an in-flight request, and the row's state evidence says so. These
+rows carry only the model name and the observation time.
 
 Live terminal rows use namespaced IDs (`ollama:cli:<pid>`) and are running only
 because a matching `ollama run <model>` process exists. Process rows retain the
 PID, model token, elapsed-derived timestamps, and safe source label; prompts,
 remaining arguments, tokens, context, and parentage are discarded. Desktop
 rows use `ollama_desktop`, while terminal rows use `ollama_cli`.
+
+`--provider ollama` is a backend filter as well as a source filter: a Codex
+thread whose persisted `model_provider` starts with `ollama` is included, keeps
+its own Codex source kind, and shows its model as `<model> via Ollama`. Codex
+threads on any other provider are excluded, and `--provider codex` is unchanged.
+Codex config is loaded for this provider only to resolve the state database
+location; Codex model defaults are never applied to Ollama-sourced rows.
 
 The JSON schema is `codex-agent-monitor.probe.v2`. Current thread state is
 limited to `running`, `idle`, and `unknown`; terminal lifecycle results are

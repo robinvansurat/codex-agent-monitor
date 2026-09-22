@@ -226,7 +226,10 @@ fn render_node(
 }
 
 fn provider_label(source_kind: Option<&str>) -> &'static str {
-    if matches!(source_kind, Some("ollama_desktop") | Some("ollama_cli")) {
+    if matches!(
+        source_kind,
+        Some("ollama_desktop") | Some("ollama_cli") | Some("ollama_api")
+    ) {
         "Ollama"
     } else if matches!(source_kind, Some("claude_code")) {
         "Claude"
@@ -241,6 +244,7 @@ fn friendly_source_kind(source_kind: Option<&str>) -> &'static str {
     match source_kind {
         Some("ollama_desktop") => "Ollama Desktop",
         Some("ollama_cli") => "Ollama CLI",
+        Some("ollama_api") => "Ollama API",
         Some("claude_code") => "Claude Code",
         Some("kiro_cli") => "Kiro CLI",
         Some("kiro_acp") => "Kiro ACP worker",

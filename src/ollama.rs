@@ -40,6 +40,15 @@ pub struct OllamaServerStatus {
     pub detail: Option<String>,
 }
 
+/// One model currently resident in the local Ollama server, as reported by
+/// `/api/ps`. Residency is keep-alive evidence: the model was used recently and
+/// is still loaded. It is not proof that a request is in flight right now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaLoadedModel {
+    pub name: String,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 pub fn default_db_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join("Library/Application Support/Ollama/db.sqlite"))
 }
@@ -361,23 +370,66 @@ pub fn parse_ps_response(response: &str) -> OllamaServerStatus {
             }
         }
     };
-    let loaded_models = parsed
-        .get("models")
-        .and_then(Value::as_array)
+    let loaded_models = parse_loaded_models(&parsed)
         .into_iter()
-        .flatten()
-        .filter_map(|model| {
-            model
-                .get("name")
-                .or_else(|| model.get("model"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .take(MAX_CHATS)
+        .map(|model| model.name)
         .collect();
     OllamaServerStatus {
         available: response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
         loaded_models,
         detail: None,
     }
+}
+
+/// Extract the resident models of an `/api/ps` body. Only the model name and
+/// its keep-alive expiry are read; prompts and responses are never present in
+/// this endpoint and no other field is retained.
+pub fn parse_loaded_models(parsed: &Value) -> Vec<OllamaLoadedModel> {
+    parsed
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let name = model
+                .get("name")
+                .or_else(|| model.get("model"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)?;
+            let expires_at = model
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp_text);
+            Some(OllamaLoadedModel { name, expires_at })
+        })
+        .take(MAX_CHATS)
+        .collect()
+}
+
+/// Build one thread row per model resident in the local Ollama server so API
+/// consumers (Codex, Claude, Kiro, or any other client) surface as running work
+/// instead of only as a server status line.
+pub fn api_threads(status: &OllamaServerStatus, now: DateTime<Utc>) -> Vec<OllamaThreadRecord> {
+    if !status.available {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    status
+        .loaded_models
+        .iter()
+        .filter(|model| !model.is_empty())
+        .filter(|model| seen.insert((*model).clone()))
+        .map(|model| OllamaThreadRecord {
+            id: format!("ollama:api:{model}"),
+            model: Some(model.clone()),
+            created_at: None,
+            updated_at: Some(now),
+            recency_at: Some(now),
+            state: crate::model::ThreadState::Running,
+            activity_at: Some(now),
+            nickname: Some(format!("Ollama serving {model}")),
+            source_kind: "ollama_api".to_string(),
+        })
+        .collect()
 }

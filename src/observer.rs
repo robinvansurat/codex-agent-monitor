@@ -250,10 +250,7 @@ impl Monitor {
             kiro::resolve_kiro_home(kiro_home.as_deref())?;
         let (resolved_claude_home, _) = claude::resolve_claude_home(None)?;
         let mut startup_warnings = Vec::new();
-        let config = if matches!(
-            provider,
-            Provider::Claude | Provider::Kiro | Provider::Ollama
-        ) {
+        let config = if matches!(provider, Provider::Claude | Provider::Kiro) {
             crate::config::ConfigContext {
                 global: None,
                 agents_dir: None,
@@ -262,7 +259,7 @@ impl Monitor {
         } else {
             match load_config(&home) {
                 Ok(config) => config,
-                Err(err) if matches!(provider, Provider::All) => {
+                Err(err) if matches!(provider, Provider::All | Provider::Ollama) => {
                     startup_warnings.push(format!("Codex config unavailable: {err}"));
                     crate::config::ConfigContext {
                         global: None,
@@ -356,7 +353,10 @@ impl Monitor {
         let mut parent_edges = Vec::new();
         let mut warnings = self.startup_warnings.clone();
         let mut rollouts: HashMap<String, RolloutParseResult> = HashMap::new();
-        if matches!(self.provider, Provider::Codex | Provider::All) {
+        if matches!(
+            self.provider,
+            Provider::Codex | Provider::All | Provider::Ollama
+        ) {
             let sqlite_root = sqlite_home(&self.codex_home, &self.config);
             let db_path = match sqlite_root {
                 SqliteHome::Directory(dir) => dir.join("state_5.sqlite"),
@@ -367,8 +367,13 @@ impl Monitor {
                     warnings.extend(db.warnings);
                     parent_edges = db.parent_edges;
                     db_threads = db.threads;
+                    if matches!(self.provider, Provider::Ollama) {
+                        // Under the Ollama filter a Codex thread is only in scope
+                        // when its persisted model provider is an Ollama backend.
+                        db_threads.retain(thread_uses_ollama);
+                    }
                 }
-                Err(err) if matches!(self.provider, Provider::All) => {
+                Err(err) if matches!(self.provider, Provider::All | Provider::Ollama) => {
                     warnings.push(format!("Codex state unavailable: {err}"));
                 }
                 Err(err) => return Err(err),
@@ -396,6 +401,14 @@ impl Monitor {
                 db_threads.push(ollama_db_record(&thread));
             }
             self.ollama_server = ollama::poll_server();
+            for thread in ollama::api_threads(&self.ollama_server, Utc::now()) {
+                if db_threads.iter().any(|existing| existing.id == thread.id) {
+                    continue;
+                }
+                let id = thread.id.clone();
+                rollouts.insert(id.clone(), ollama_rollout(&thread));
+                db_threads.push(ollama_db_record(&thread));
+            }
         }
         let mut claude_paths = HashMap::<String, PathBuf>::new();
         let mut claude_account_usage = Observed::<AccountUsage>::unknown();
@@ -581,7 +594,17 @@ impl Monitor {
             }
 
             let requested = requested_model(thread, rollouts.get(&thread.id));
-            let configured = configured_model(thread, &self.config);
+            // Codex config defaults describe Codex threads only; an Ollama row has
+            // no Codex configuration behind it.
+            let configured = if thread
+                .source_kind
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("ollama_"))
+            {
+                Observed::unknown()
+            } else {
+                configured_model(thread, &self.config)
+            };
             let is_kiro = thread
                 .source_kind
                 .as_deref()
@@ -858,6 +881,7 @@ fn ollama_rollout(thread: &OllamaThreadRecord) -> RolloutParseResult {
     };
     RolloutParseResult {
         final_state,
+        final_state_at: thread.activity_at,
         latest_lifecycle_at: thread.activity_at,
         latest_activity_at: thread.activity_at,
         ..RolloutParseResult::default()
@@ -1397,8 +1421,11 @@ fn thread_evidence(
         .source_kind
         .as_deref()
         .is_some_and(|kind| kind.starts_with("kiro_"));
+    let ollama_api_source = thread.source_kind.as_deref() == Some("ollama_api");
     let session_source = if kiro_source {
         "kiro.session"
+    } else if ollama_api_source {
+        "ollama.api.ps"
     } else {
         "persisted-session"
     };
@@ -1482,6 +1509,8 @@ fn thread_evidence(
                 kind: session_source.to_string(),
                 detail: Some(if kiro_source {
                     "derived from Kiro lifecycle".to_string()
+                } else if ollama_api_source {
+                    "model resident in the local Ollama server".to_string()
                 } else {
                     "derived from rollout lifecycle".to_string()
                 }),
@@ -1492,7 +1521,12 @@ fn thread_evidence(
             } else {
                 Confidence::Medium
             },
-            detail: Some("thread state".to_string()),
+            detail: Some(if ollama_api_source {
+                "model loaded in the local Ollama server; keep-alive residency indicates recent use, not a confirmed in-flight request"
+                    .to_string()
+            } else {
+                "thread state".to_string()
+            }),
         },
         cwd: cwd
             .map(|value| {

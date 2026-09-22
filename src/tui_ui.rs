@@ -875,7 +875,7 @@ fn render_agent_card(frame: &mut Frame, area: Rect, row: &ListRow, is_selected: 
                 .fg(if row.provider_label == "Kiro" {
                     Color::Magenta
                 } else {
-                    Color::Blue
+                    Color::Rgb(0, 255, 255)
                 })
                 .add_modifier(Modifier::BOLD),
         ),
@@ -1475,7 +1475,10 @@ fn matches_filter_query(row: &ListRow, query: &str) -> bool {
 }
 
 fn provider_for_source_kind(source_kind: Option<&str>) -> String {
-    if matches!(source_kind, Some("ollama_desktop") | Some("ollama_cli")) {
+    if matches!(
+        source_kind,
+        Some("ollama_desktop") | Some("ollama_cli") | Some("ollama_api")
+    ) {
         "Ollama".to_string()
     } else if matches!(source_kind, Some("claude_code")) {
         "Claude".to_string()
@@ -1490,6 +1493,7 @@ fn friendly_source_kind(source_kind: &str) -> &str {
     match source_kind {
         "ollama_desktop" => "Ollama Desktop",
         "ollama_cli" => "Ollama CLI",
+        "ollama_api" => "Ollama API",
         "claude_code" => "Claude Code",
         "kiro_cli" => "Kiro CLI",
         "kiro_acp" => "Kiro ACP worker",
