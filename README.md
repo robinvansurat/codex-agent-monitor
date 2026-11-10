@@ -1,6 +1,6 @@
 # codex-agent-monitor
 
-`codex-agent-monitor` is an open-source read-only local monitor for Codex, Claude Code, Kiro, and Ollama persisted state.
+`codex-agent-monitor` is an open-source local monitor for Codex, Claude Code, Kiro, Ollama, and GitHub Copilot persisted state. The monitor reads provider state without modifying it; its optional Claude Code status-line bridge writes a minimized local cache.
 
 ## What it is / is not
 
@@ -29,6 +29,8 @@ It is **not**:
 - Optional `--runtime-events` overlay (`model/rerouted`) for ephemeral effective model/reroute facts
 - Claude Code CLI session inspection with `--provider claude` or `--provider all`, including per-session cumulative token counters and live-process state
 - Kiro CLI and ACP session inspection with `--provider kiro` or `--provider all`
+- GitHub Copilot CLI/Desktop session-state inspection with `--provider copilot` or `--provider all`
+- VS Code Copilot Chat session metadata from locally persisted chats; ambiguous sessions without an explicit Copilot Chat extension identity are skipped
 - Ollama Desktop chat metadata with `--provider ollama` or `--provider all`; local Ollama API availability and loaded model names are reported when reachable
 - Live `ollama run <model>` process rows with safe model/PID telemetry, plus a running row per model resident in the local Ollama API (`ollama:api:<model>`), labeled as keep-alive residency rather than a confirmed in-flight request
 - `--provider ollama` also returns Codex threads whose persisted `model_provider` is an Ollama backend, shown as `<model> via Ollama`
@@ -63,10 +65,11 @@ Commands:
 
 Global/command options include:
 
-- `--provider {codex,claude,kiro,ollama,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode). `--provider ollama` covers both Ollama's own sources and threads of other providers running on an Ollama backend
+- `--provider {codex,claude,kiro,ollama,copilot,all}`: choose the persisted source (default `all`; use `--provider codex` for Codex-only mode). `--provider ollama` covers both Ollama's own sources and threads of other providers running on an Ollama backend
 - `--claude-home <path>` (or `CLAUDE_CONFIG_DIR`): Claude Code home to inspect; defaults to `~/.claude`
-- `--claude-usage-file <path>`: explicit Claude plan utilisation history; otherwise the Claude desktop app's `plan-usage-history.json` is used
+- `--claude-usage-file <path>`: explicit Claude Desktop plan utilisation history. Without an override, the optional status-line cache is preferred, then Claude Desktop's `plan-usage-history.json` is used
 - `--kiro-home <path>` (or `KIRO_HOME`): Kiro home to inspect; defaults to `~/.kiro`
+- `--copilot-home <path>` (or `COPILOT_HOME`): Copilot home to inspect; defaults to `~/.copilot`
 - `--kiro-db <path>`: explicit legacy Kiro SQLite database override
 - `--ollama-db <path>`: explicit Ollama Desktop SQLite database override; otherwise macOS `~/Library/Application Support/Ollama/db.sqlite` is used
 - `--kiro-cli <path>`: explicit `kiro-cli` executable for the authenticated Kiro credit lookup
@@ -83,6 +86,33 @@ Global/command options include:
   - `-` is supported for `probe` only
   - watch/TUI reject `-` to avoid blocking
 - `--json` and `--format json` (both supported)
+
+`--copilot-home` selects the shared Copilot CLI/Desktop session-state root.
+VS Code chats are read from the standard VS Code `User/workspaceStorage`
+directory for the current OS. Only records with an explicit
+`GitHub.copilot-chat` extension identity are included. VS Code records need
+their full composite thread ID with `--thread`, because a session ID alone may
+not be unique across workspaces. Persisted VS Code data does not prove session
+lifecycle or cumulative token usage, so those fields remain unknown. VS Code
+chat files over 16 MiB and JSONL lines over 4 MiB are skipped with an
+aggregate warning; message and tool content is not retained.
+
+Copilot session-state rows are `running` only when the latest lifecycle evidence
+contains an unmatched `assistant.turn_start` and its session directory has a
+regular, non-symlink `inuse.<pid>.lock` whose bounded numeric content matches
+the filename PID and a currently visible process. A live lock alone does not
+indicate an active turn; missing or uncertain lock/tail evidence stays unknown.
+An explicit latest `session.shutdown` retains the existing idle state. PID
+reuse and races during client crash or recovery can still limit certainty.
+
+Copilot token totals use a complete, contiguous ledger of distinct persisted
+`session.usage_record` receipts when accounting identity and sequence coverage
+can be verified. The cumulative total is input plus output only; cache and
+reasoning counters are excluded. This is verified persisted usage, not billing.
+When receipt continuity cannot be proven, the existing current single
+`session.shutdown` snapshot may be shown; otherwise the cumulative total stays
+unknown. The latest persisted `session.usage_record` is also shown separately
+as **Last request** and is never added to session or global totals.
 
 ## Output and JSON schema
 
@@ -142,9 +172,43 @@ Claude plan utilisation comes from the Claude desktop app's
 seven-day (`sd`) percentage. The newest sample carrying a percentage is
 reported as the standard primary/secondary account windows; the `org` account
 identifier in that file is never read out. The history records utilisation
-only, so `resets_at` stays unknown rather than being estimated, and the
-displayed percentage is remaining allowance, matching the Codex line. When the
-desktop app is not installed the file is absent and the value stays unknown.
+only, so `resets_at` stays unknown rather than being estimated. The Claude
+header displays the percentage used, includes the observation age, and marks
+the plan segment `(stale)` when its observation is more than 30 minutes old.
+When the observation timestamp is missing, its age is shown as unknown; if no
+source has usable data, the value stays unknown.
+
+For Claude Code CLI rate limits, the optional bridge in
+`scripts/claude-statusline-rate-limits.sh` reads the documented status-line JSON
+and stores only the session ID, prompt ID, cumulative API duration, 5h/7d rate
+limits, and a local observation timestamp under
+`${XDG_CACHE_HOME:-$HOME/.cache}/codex-agent-monitor/claude-rate-limits/`.
+Install `jq`, copy the script to a stable local path, and make it executable:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+cp scripts/claude-statusline-rate-limits.sh "$HOME/.local/bin/claude-statusline-rate-limits"
+chmod +x "$HOME/.local/bin/claude-statusline-rate-limits"
+```
+
+Add this entry to Claude Code's user `settings.json` (merge it with existing
+settings; replace the path with the absolute path on your machine):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/claude-statusline-rate-limits"
+  }
+}
+```
+
+The bridge makes no network requests and reads no credentials or prompt text.
+It refreshes the cache only when the API response fingerprint changes, so
+status-line reruns caused only by mode changes do not make old usage appear
+fresh. Claude Code supplies rate limits after an API response, so an idle
+session may retain an older observation. A custom status line also hides most
+of Claude Code's built-in keyboard hints.
 
 Claude token usage is cumulative per session, summed across responses and
 de-duplicated by response ID, because one API response is persisted as several

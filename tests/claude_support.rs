@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-use codex_agent_monitor::claude::{parse_plan_usage, read_plan_usage, read_snapshot};
+use chrono::{Duration, Utc};
+use codex_agent_monitor::claude::{
+    parse_plan_usage, read_plan_usage, read_plan_usage_or_statusline_from, read_snapshot,
+    read_statusline_usage_from_dir,
+};
 use codex_agent_monitor::cli::{FilterOpts, OutputFormat, Provider};
 use codex_agent_monitor::model::ThreadState;
 use codex_agent_monitor::observer::Monitor;
@@ -483,5 +487,190 @@ fn plan_usage_reaches_the_probe_output() {
     assert_eq!(
         usage.secondary.as_ref().and_then(|w| w.window_minutes),
         Some(10_080)
+    );
+}
+
+fn write_statusline_cache(
+    dir: &Path,
+    session_id: &str,
+    observed_at: chrono::DateTime<Utc>,
+    rate_limits: serde_json::Value,
+) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join(format!("{session_id}.json")),
+        serde_json::json!({
+            "session_id": session_id,
+            "prompt_id": "SECRET_PROMPT_ID",
+            "cost": {"total_api_duration_ms": 4000},
+            "rate_limits": rate_limits,
+            "observed_at": observed_at.to_rfc3339(),
+            "prompt": "SECRET_PROMPT",
+            "token": "SECRET_TOKEN",
+            "transcript_path": "/private/SECRET_TRANSCRIPT"
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn statusline_rate_limits_select_newest_coherent_session_without_sensitive_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let now = Utc::now();
+    let future = (now + Duration::hours(2)).timestamp();
+    write_statusline_cache(
+        &cache,
+        "session-old",
+        now - Duration::minutes(3),
+        serde_json::json!({
+            "five_hour": {"used_percentage": 20, "resets_at": future},
+            "seven_day": {"used_percentage": 3, "resets_at": future}
+        }),
+    );
+    write_statusline_cache(
+        &cache,
+        "session-new",
+        now - Duration::minutes(1),
+        serde_json::json!({
+            "seven_day": {"used_percentage": 41.5, "resets_at": future}
+        }),
+    );
+
+    let observed = read_statusline_usage_from_dir(Some(&cache), now).expect("cache snapshot");
+    let usage = observed.value.as_ref().expect("account usage");
+    assert!(usage.primary.is_none(), "sessions must not be merged");
+    let weekly = usage.secondary.as_ref().expect("new session weekly window");
+    assert_eq!(weekly.used_percent, Some(41.5));
+    assert_eq!(weekly.window_minutes, Some(10_080));
+    assert_eq!(weekly.resets_at.map(|time| time.timestamp()), Some(future));
+    assert_eq!(
+        observed.source.as_ref().unwrap().kind,
+        "claude.statusline.rate_limits"
+    );
+
+    let encoded = serde_json::to_string(&observed).unwrap();
+    for secret in [
+        "SECRET_PROMPT_ID",
+        "SECRET_PROMPT",
+        "SECRET_TOKEN",
+        "SECRET_TRANSCRIPT",
+    ] {
+        assert!(
+            !encoded.contains(secret),
+            "sensitive field leaked: {encoded}"
+        );
+    }
+}
+
+#[test]
+fn statusline_rate_limits_ignore_expired_invalid_and_oversized_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let now = Utc::now();
+    write_statusline_cache(
+        &cache,
+        "expired",
+        now,
+        serde_json::json!({
+            "five_hour": {"used_percentage": 10, "resets_at": (now - Duration::seconds(1)).timestamp()}
+        }),
+    );
+    write_statusline_cache(
+        &cache,
+        "invalid",
+        now + Duration::seconds(1),
+        serde_json::json!({
+            "five_hour": {"used_percentage": 101, "resets_at": (now + Duration::hours(1)).timestamp()},
+            "seven_day": {"used_percentage": 9, "resets_at": "not-unix-time"}
+        }),
+    );
+    write_statusline_cache(
+        &cache,
+        "missing-reset",
+        now + Duration::seconds(2),
+        serde_json::json!({
+            "five_hour": {"used_percentage": 9},
+            "seven_day": {"used_percentage": 10, "resets_at": null}
+        }),
+    );
+    fs::write(
+        cache.join("oversized.json"),
+        format!("{{\"padding\":\"{}\"}}", "x".repeat(20 * 1024)),
+    )
+    .unwrap();
+
+    assert!(read_statusline_usage_from_dir(Some(&cache), now).is_none());
+}
+
+#[test]
+fn statusline_selection_preserves_explicit_override_and_desktop_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let desktop = temp.path().join("plan-usage-history.json");
+    let explicit = temp.path().join("explicit-plan-usage-history.json");
+    let now = Utc::now();
+    let future = (now + Duration::hours(1)).timestamp();
+    write_statusline_cache(
+        &cache,
+        "session-1",
+        now,
+        serde_json::json!({
+            "five_hour": {"used_percentage": 12, "resets_at": future}
+        }),
+    );
+    let desktop_data = serde_json::json!({
+        "samples": [{"t": 1_789_923_790_763_i64, "u": {"fh": 44, "sd": 7}}]
+    });
+    fs::write(&desktop, desktop_data.to_string()).unwrap();
+    fs::write(
+        &explicit,
+        serde_json::json!({
+            "samples": [{"t": 1_789_923_790_763_i64, "u": {"fh": 55}}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let selected = read_plan_usage_or_statusline_from(None, Some(&cache), Some(&desktop));
+    assert_eq!(
+        selected
+            .value
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        Some(12.0)
+    );
+
+    let explicit_usage =
+        read_plan_usage_or_statusline_from(Some(&explicit), Some(&cache), Some(&desktop));
+    assert_eq!(
+        explicit_usage
+            .value
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        Some(55.0)
+    );
+
+    let invalid_cache = temp.path().join("invalid-cache");
+    let fallback = read_plan_usage_or_statusline_from(None, Some(&invalid_cache), Some(&desktop));
+    assert_eq!(
+        fallback
+            .value
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        Some(44.0)
     );
 }

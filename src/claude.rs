@@ -22,6 +22,8 @@ const MAX_SESSION_FILES: usize = 500;
 const MAX_TRANSCRIPT_LINES: usize = 200_000;
 const MAX_ACTIVITY: usize = 25;
 const MAX_PLAN_USAGE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_STATUSLINE_FILES: usize = 128;
+const MAX_STATUSLINE_FILE_BYTES: u64 = 16 * 1024;
 const FIVE_HOUR_WINDOW_MINUTES: u64 = 300;
 const SEVEN_DAY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 
@@ -567,6 +569,136 @@ pub fn read_plan_usage(path: Option<&Path>) -> Observed<AccountUsage> {
         return Observed::unknown();
     };
     parse_plan_usage(&value)
+}
+
+/// Use an explicit Desktop history override as-is. Without one, prefer a
+/// usable observation supplied by the optional Claude Code status-line bridge,
+/// then fall back to Claude Desktop's local plan history.
+pub fn read_plan_usage_or_statusline(path: Option<&Path>) -> Observed<AccountUsage> {
+    read_plan_usage_or_statusline_from(
+        path,
+        default_statusline_cache_dir().as_deref(),
+        default_plan_usage_path().as_deref(),
+    )
+}
+
+/// Same source selection with resolved paths supplied by the caller.
+pub fn read_plan_usage_or_statusline_from(
+    explicit_path: Option<&Path>,
+    statusline_cache_dir: Option<&Path>,
+    desktop_fallback_path: Option<&Path>,
+) -> Observed<AccountUsage> {
+    if explicit_path.is_some() {
+        return read_plan_usage(explicit_path);
+    }
+    if let Some(observation) = read_statusline_usage_from_dir(statusline_cache_dir, Utc::now()) {
+        observation
+    } else {
+        read_plan_usage(desktop_fallback_path)
+    }
+}
+
+fn default_statusline_cache_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cache")))
+        .map(|cache| cache.join("codex-agent-monitor/claude-rate-limits"))
+}
+
+pub fn read_statusline_usage_from_dir(
+    dir: Option<&Path>,
+    now: DateTime<Utc>,
+) -> Option<Observed<AccountUsage>> {
+    let dir = dir?;
+    let entries = fs::read_dir(dir).ok()?;
+    let mut paths = entries
+        .take(MAX_STATUSLINE_FILES)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    paths
+        .iter()
+        .filter_map(|path| read_statusline_observation(path, now))
+        .max_by_key(|observation| observation.observed_at)
+}
+
+fn read_statusline_observation(path: &Path, now: DateTime<Utc>) -> Option<Observed<AccountUsage>> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_STATUSLINE_FILE_BYTES {
+        return None;
+    }
+    let raw = fs::read(path).ok()?;
+    if raw.len() as u64 > MAX_STATUSLINE_FILE_BYTES {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(&raw).ok()?;
+    let session_id = value.get("session_id")?.as_str()?;
+    if !is_safe_session_id(session_id)
+        || path.file_stem().and_then(|name| name.to_str()) != Some(session_id)
+    {
+        return None;
+    }
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)?;
+    let rate_limits = value.get("rate_limits")?;
+    let primary = rate_limits
+        .get("five_hour")
+        .and_then(|value| statusline_window(value, FIVE_HOUR_WINDOW_MINUTES, now));
+    let secondary = rate_limits
+        .get("seven_day")
+        .and_then(|value| statusline_window(value, SEVEN_DAY_WINDOW_MINUTES, now));
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+    Some(Observed {
+        value: Some(AccountUsage { primary, secondary }),
+        source: Some(EvidenceSource {
+            kind: "claude.statusline.rate_limits".to_string(),
+            detail: Some("local Claude Code status-line cache".to_string()),
+        }),
+        observed_at: Some(observed_at),
+        confidence: Confidence::Medium,
+        detail: Some("rate limits supplied by Claude Code status-line input".to_string()),
+    })
+}
+
+fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id != "."
+        && session_id != ".."
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn statusline_window(
+    value: &Value,
+    window_minutes: u64,
+    now: DateTime<Utc>,
+) -> Option<AccountUsageWindow> {
+    let used_percent = percent_field(value, "used_percentage")?;
+    let reset_value = value.get("resets_at")?;
+    let seconds = reset_value.as_i64().or_else(|| {
+        reset_value
+            .as_u64()
+            .and_then(|seconds| i64::try_from(seconds).ok())
+    })?;
+    let resets_at = DateTime::<Utc>::from_timestamp(seconds, 0)?;
+    if resets_at <= now {
+        return None;
+    };
+    Some(AccountUsageWindow {
+        used_percent: Some(used_percent),
+        window_minutes: Some(window_minutes),
+        resets_at: Some(resets_at),
+    })
 }
 
 pub fn parse_plan_usage(value: &Value) -> Observed<AccountUsage> {

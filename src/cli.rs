@@ -2,7 +2,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "codex-agent-monitor")]
-#[command(about = "Inspect Codex, Claude, Kiro, and Ollama thread activity from persisted state")]
+#[command(
+    about = "Inspect Codex, Claude, Kiro, Ollama, and Copilot thread activity from persisted state"
+)]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -29,6 +31,8 @@ pub struct SharedArgs {
     pub claude_home: Option<String>,
     #[arg(long, global = true)]
     pub claude_usage_file: Option<String>,
+    #[arg(long, global = true, env = "COPILOT_HOME")]
+    pub copilot_home: Option<String>,
     #[arg(long, global = true)]
     pub kiro_cli: Option<String>,
     #[arg(long, global = true)]
@@ -77,8 +81,16 @@ pub enum Provider {
     Claude,
     Kiro,
     Ollama,
+    Copilot,
     #[default]
     All,
+}
+
+impl Provider {
+    /// Copilot CLI and Desktop share one local source, read once.
+    pub fn includes_copilot(&self) -> bool {
+        matches!(self, Provider::Copilot | Provider::All)
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -271,5 +283,22 @@ mod tests {
             claude_cli.shared.claude_home.as_deref(),
             Some("/tmp/claude")
         );
+
+        let copilot_cli = Cli::try_parse_from([
+            "codex-agent-monitor",
+            "--provider",
+            "copilot",
+            "--copilot-home",
+            "/tmp/copilot",
+        ])
+        .expect("parse Copilot options");
+        assert_eq!(merge_tui_args(&copilot_cli).provider, Provider::Copilot);
+        assert_eq!(
+            copilot_cli.shared.copilot_home.as_deref(),
+            Some("/tmp/copilot")
+        );
+        assert!(Provider::Copilot.includes_copilot());
+        assert!(Provider::All.includes_copilot());
+        assert!(!Provider::Codex.includes_copilot());
     }
 }

@@ -1,6 +1,6 @@
 use crate::model::{
-    ActivitySignal, ContextUsage, KiroAccountUsage, LastTerminalEvent, ModelSpec, Observed,
-    ProbeOutput, TaskProgress, ThreadState, TokenUsage,
+    ActivitySignal, ContextUsage, KiroAccountUsage, LastRequestTokenUsage, LastTerminalEvent,
+    ModelSpec, Observed, ProbeOutput, TaskProgress, ThreadState, TokenUsage,
 };
 use chrono::Utc;
 
@@ -14,6 +14,7 @@ pub fn render_human(summary: &ProbeOutput) -> String {
         match summary.query.provider.as_deref() {
             Some("claude") => "Claude Agent Monitor",
             Some("kiro") => "Kiro Agent Monitor",
+            Some("copilot") => "GitHub Copilot Monitor",
             Some("ollama") => "Ollama Agent Monitor",
             Some("all") => "Codex + Claude + Kiro (Ollama)",
             _ => "Codex Agent Monitor",
@@ -160,6 +161,14 @@ fn render_node(
             observed_token_usage_label(&t.token_usage),
             source_label(&t.token_usage.source),
         ));
+        if let Some(label) = last_request_usage_label(&t.last_request_usage) {
+            out.push_str(&format!(
+                "{}  last request (not a session total): {} (source={})\n",
+                prefix,
+                label,
+                source_label(&t.last_request_usage.source),
+            ));
+        }
         if t.context_usage.value.is_some() {
             out.push_str(&format!(
                 "{}  context usage: {} (source={})\n",
@@ -235,6 +244,11 @@ fn provider_label(source_kind: Option<&str>) -> &'static str {
         "Claude"
     } else if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
         "Kiro"
+    } else if matches!(
+        source_kind,
+        Some("copilot_session_state" | "copilot_vscode_chat")
+    ) {
+        "Copilot"
     } else {
         "Codex"
     }
@@ -248,6 +262,8 @@ fn friendly_source_kind(source_kind: Option<&str>) -> &'static str {
         Some("claude_code") => "Claude Code",
         Some("kiro_cli") => "Kiro CLI",
         Some("kiro_acp") => "Kiro ACP worker",
+        Some("copilot_session_state") => "Copilot session state",
+        Some("copilot_vscode_chat") => "VS Code Copilot Chat",
         Some(_) => "Codex",
         None => "unknown",
     }
@@ -419,6 +435,24 @@ fn observed_token_usage_label(value: &Observed<TokenUsage>) -> String {
     )
 }
 
+fn last_request_usage_label(value: &Observed<LastRequestTokenUsage>) -> Option<String> {
+    let usage = value.value.as_ref()?;
+    let observed_at = value
+        .observed_at
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    Some(format!(
+        "total={} input={} cached_input={} cache_write_input={} output={} reasoning_output={} observed_at={}",
+        token_count_label(usage.total_tokens),
+        token_count_label(usage.input_tokens),
+        token_count_label(usage.cached_input_tokens),
+        token_count_label(usage.cache_write_input_tokens),
+        token_count_label(usage.output_tokens),
+        token_count_label(usage.reasoning_output_tokens),
+        observed_at,
+    ))
+}
+
 fn observed_context_usage_label(value: &Observed<ContextUsage>) -> String {
     let Some(usage) = value.value.as_ref() else {
         return "unavailable".to_string();
@@ -500,6 +534,37 @@ mod tests {
         let json = serde_json::to_string(&observed).expect("serialize token usage");
         assert!(json.contains("\"total_tokens\":1831"));
         assert!(json.contains("\"cache_write_input_tokens\":null"));
+    }
+
+    #[test]
+    fn last_request_label_keeps_missing_counters_unknown() {
+        assert!(last_request_usage_label(&Observed::unknown()).is_none());
+        let observed = Observed {
+            value: Some(LastRequestTokenUsage {
+                input_tokens: None,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                output_tokens: Some(1_200),
+                reasoning_output_tokens: None,
+                total_tokens: None,
+            }),
+            source: Some(EvidenceSource {
+                kind: "copilot.session_usage_record".to_string(),
+                detail: None,
+            }),
+            observed_at: Some(Utc.timestamp_opt(1_720_000_000, 0).unwrap()),
+            confidence: Confidence::Medium,
+            detail: None,
+        };
+        let label = last_request_usage_label(&observed).unwrap();
+        assert!(label.contains("total=<none>"), "{label}");
+        assert!(label.contains("input=<none>"), "{label}");
+        assert!(label.contains("output=1,200"), "{label}");
+        assert!(
+            label.contains("observed_at=2024-07-03T09:46:40+00:00"),
+            "{label}"
+        );
+        assert!(!label.contains("=0 "), "{label}");
     }
 
     #[test]

@@ -141,6 +141,20 @@ pub struct TokenUsage {
     pub context_window: Option<u64>,
 }
 
+/// Token counters for one request (for example a Copilot
+/// `session.usage_record`). Never a session total and never summed into
+/// session or global aggregates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastRequestTokenUsage {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    /// `input_tokens + output_tokens` when both are known and the sum fits.
+    pub total_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContextUsage {
     pub used_percent: f64,
@@ -292,6 +306,10 @@ pub struct ThreadSnapshot {
     pub activity_signal: Observed<ActivitySignal>,
     pub model: ModelSummary,
     pub token_usage: Observed<TokenUsage>,
+    /// Latest single-request usage, shown only when cumulative `token_usage`
+    /// is not provable. Separate from `token_usage` and never aggregated.
+    #[serde(default, skip_serializing_if = "is_unknown_observed")]
+    pub last_request_usage: Observed<LastRequestTokenUsage>,
     #[serde(default, skip_serializing_if = "is_unknown_observed")]
     pub context_usage: Observed<ContextUsage>,
     #[serde(default, skip_serializing_if = "is_unknown_observed")]

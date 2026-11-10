@@ -26,7 +26,7 @@
 
 ## Scope and constraints preserved
 
-- read-only operation only (no DB write, no auth/token reads, no local/remote state mutation)
+- the monitor reads local provider state without modifying it (no DB writes, auth/token reads, or remote state mutation); the optional Claude Code status-line bridge separately writes only its minimized rate-limit snapshot to the local cache
 - `--runtime-events -` support is intentionally one-shot in `probe`; long-lived modes reject stdin input to avoid blocking and keep TUI/watch deterministic
 - watch cadence is debounced by cache checks on file size + mtime, avoiding repeated full replay of unchanged rollout history
 - parser is intentionally conservative around malformed JSONL tails:

@@ -139,7 +139,7 @@ fn fetch_usage(
         )?;
         let initialize = wait_for_response(cancel, &receiver, &mut stdin, 1, deadline)
             .map_err(|err| anyhow!("initialize: {err}"))?;
-        validate_initialize_response(&initialize)?;
+        validate_initialize_response(&initialize).map_err(|err| anyhow!("initialize: {err}"))?;
         write_request(
             &mut stdin,
             &json!({
@@ -217,17 +217,81 @@ fn wait_for_response(
 
 fn validate_initialize_response(line: &str) -> Result<()> {
     let message = serde_json::from_str::<Value>(line)?;
-    let result = message.get("result");
-    if message.get("error").is_some()
-        || result.is_none()
-        || result
-            .and_then(|value| value.get("success"))
-            .and_then(Value::as_bool)
-            == Some(false)
-    {
-        return Err(anyhow!("Kiro initialize failed"));
+    if let Some(error) = response_failure(&message) {
+        return Err(anyhow!(error));
+    }
+    if message.get("result").is_none() {
+        return Err(anyhow!("native lookup unavailable"));
     }
     Ok(())
+}
+
+fn response_failure(message: &Value) -> Option<&'static str> {
+    if let Some(error) = message.get("error") {
+        return Some(classify_failure(
+            error.get("message").and_then(Value::as_str).unwrap_or(""),
+        ));
+    }
+    let result = message.get("result")?;
+    if result.get("success").and_then(Value::as_bool) == Some(false) {
+        return Some(classify_failure(
+            result.get("message").and_then(Value::as_str).unwrap_or(""),
+        ));
+    }
+    None
+}
+
+fn classify_failure(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("operation not permitted")
+        || lower.contains("permission denied")
+        || contains_word(&lower, "eperm")
+        || contains_word(&lower, "eacces")
+        || contains_os_error_code(&lower, 1)
+        || contains_os_error_code(&lower, 13)
+    {
+        "native lookup permission denied (sandbox or OS restriction)"
+    } else if lower.contains("authentication failed")
+        || lower.contains("auth refresh failed")
+        || lower.contains("authentication error")
+        || lower.contains("not authenticated")
+        || lower.contains("unauthorized")
+    {
+        "native lookup authentication failed"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "native lookup timed out"
+    } else {
+        "native lookup unavailable"
+    }
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + word.len()..].chars().next();
+        !before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && !after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+fn contains_os_error_code(text: &str, expected: u32) -> bool {
+    let mut remainder = text;
+    while let Some(index) = remainder.find("os error ") {
+        let digits = &remainder[index + "os error ".len()..];
+        let len = digits.chars().take_while(char::is_ascii_digit).count();
+        if len > 0 {
+            let next = digits[len..].chars().next();
+            if digits[..len].parse::<u32>().ok() == Some(expected)
+                && !next.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                return true;
+            }
+            remainder = &digits[len..];
+        } else {
+            remainder = digits;
+        }
+    }
+    false
 }
 
 struct ChildGuard {
@@ -294,6 +358,9 @@ impl Drop for ChildGuard {
 
 fn parse_usage_response_line(line: &str) -> Result<Observed<KiroAccountUsage>> {
     let message = serde_json::from_str::<Value>(line)?;
+    if let Some(error) = response_failure(&message) {
+        return Err(anyhow!(error));
+    }
     let result = message
         .get("result")
         .filter(|value| value.get("success").and_then(Value::as_bool) == Some(true))
@@ -437,12 +504,28 @@ fn executable_name() -> &'static str {
 }
 
 fn safe_error(value: &str) -> String {
-    if value.contains("timed out") {
-        "native lookup timed out".to_string()
-    } else if value.contains("start") {
+    const CATEGORIES: [&str; 5] = [
+        "native lookup permission denied (sandbox or OS restriction)",
+        "native lookup authentication failed",
+        "native lookup timed out",
+        "native CLI unavailable",
+        "native lookup unavailable",
+    ];
+    if let Some(category) = CATEGORIES
+        .iter()
+        .find(|category| value.contains(**category))
+        .copied()
+    {
+        return category.to_string();
+    }
+    let classified = classify_failure(value);
+    if classified != "native lookup unavailable" {
+        return classified.to_string();
+    }
+    if value.contains("unable to start Kiro account lookup") {
         "native CLI unavailable".to_string()
     } else {
-        "native lookup unavailable".to_string()
+        classified.to_string()
     }
 }
 
@@ -533,6 +616,161 @@ sleep 5
         let error =
             fetch_usage(script.path(), Duration::from_secs(2), &cancel_receiver).unwrap_err();
         assert!(error.to_string().contains("initialize"));
+    }
+
+    #[test]
+    fn classifies_rpc_permission_errors_without_os_code_prefix_matches() {
+        assert_eq!(
+            response_failure(
+                &json!({"error":{"code":-1,"message":"Operation not permitted (os error 1)"}})
+            ),
+            Some("native lookup permission denied (sandbox or OS restriction)")
+        );
+        assert_eq!(
+            classify_failure("EPERM"),
+            "native lookup permission denied (sandbox or OS restriction)"
+        );
+        assert_eq!(
+            classify_failure("EACCES"),
+            "native lookup permission denied (sandbox or OS restriction)"
+        );
+        assert_eq!(
+            classify_failure("os error 13"),
+            "native lookup permission denied (sandbox or OS restriction)"
+        );
+        assert_eq!(
+            classify_failure("os error 100"),
+            "native lookup unavailable"
+        );
+        assert_eq!(
+            classify_failure("os error 113"),
+            "native lookup unavailable"
+        );
+        assert_eq!(classify_failure("xEPERM"), "native lookup unavailable");
+        assert_eq!(
+            classify_failure("EPERM_suffix"),
+            "native lookup unavailable"
+        );
+        assert_eq!(
+            classify_failure("os error 1abc"),
+            "native lookup unavailable"
+        );
+        assert_eq!(
+            classify_failure("permission heuristic failed"),
+            "native lookup unavailable"
+        );
+    }
+
+    #[test]
+    fn permission_failure_precedes_authentication_failure() {
+        assert_eq!(
+            classify_failure("Authentication failed: operation not permitted"),
+            "native lookup permission denied (sandbox or OS restriction)"
+        );
+        assert_eq!(
+            response_failure(
+                &json!({"result":{"success":false,"message":"Authentication failed"}})
+            ),
+            Some("native lookup authentication failed")
+        );
+    }
+
+    #[test]
+    fn safe_error_preserves_canonical_categories_when_wrapped() {
+        for category in [
+            "native lookup permission denied (sandbox or OS restriction)",
+            "native lookup authentication failed",
+            "native lookup timed out",
+            "native CLI unavailable",
+            "native lookup unavailable",
+        ] {
+            assert_eq!(safe_error(&format!("initialize: {category}")), category);
+        }
+    }
+
+    #[test]
+    fn spawn_permission_denial_precedes_cli_unavailable() {
+        assert_eq!(
+            safe_error("unable to start Kiro account lookup: Permission denied (os error 13)"),
+            "native lookup permission denied (sandbox or OS restriction)"
+        );
+        assert_eq!(
+            safe_error("unable to start Kiro account lookup: No such file or directory"),
+            "native CLI unavailable"
+        );
+    }
+
+    #[test]
+    fn unknown_rpc_failure_does_not_leak_message() {
+        let secret = "fake-token-123";
+        let error = response_failure(&json!({
+            "result":{"success":false,"message":format!("unexpected failure {secret} at /private/account")}
+        }))
+        .unwrap();
+        let observed = unknown(error);
+        let serialized = serde_json::to_string(&observed).unwrap();
+        assert_eq!(
+            observed.detail.as_deref(),
+            Some("native lookup unavailable")
+        );
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("/private/account"));
+    }
+
+    #[test]
+    fn malformed_and_missing_credit_responses_remain_unknown() {
+        assert_eq!(
+            safe_error(
+                &serde_json::from_str::<Value>("not-json")
+                    .unwrap_err()
+                    .to_string()
+            ),
+            "native lookup unavailable"
+        );
+        assert!(parse_usage_response_line(
+            r#"{"result":{"success":true,"data":{"usageBreakdowns":[]}}}"#
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_usage_classifies_verified_permission_denial_after_initialize() {
+        let script = executable_script(
+            r#"
+read initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read usage
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"success":false,"message":"Failed to retrieve usage information: Authentication failed: Auth refresh callback failed: Internal error: auth refresh failed: Operation not permitted (os error 1)"}}'
+"#,
+        );
+        let (_cancel_sender, cancel_receiver) = mpsc::channel();
+        let error = fetch_usage(script.path(), Duration::from_secs(3), &cancel_receiver)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            safe_error(&error),
+            "native lookup permission denied (sandbox or OS restriction)"
+        );
+        assert!(!error.contains("Authentication failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_auth_failure_is_sanitized_and_stops_before_usage_query() {
+        let script = executable_script(
+            r#"
+read initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"success":false,"message":"Authentication failed with fake-secret"}}'
+sleep 5
+"#,
+        );
+        let (_cancel_sender, cancel_receiver) = mpsc::channel();
+        let error = fetch_usage(script.path(), Duration::from_secs(2), &cancel_receiver)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(safe_error(&error), "native lookup authentication failed");
+        assert!(!error.contains("fake-secret"));
     }
 
     #[cfg(unix)]

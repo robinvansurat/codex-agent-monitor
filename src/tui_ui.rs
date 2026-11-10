@@ -22,8 +22,8 @@ use ratatui::{
 use crate::cli::FilterOpts;
 use crate::model::{
     AccountUsage, AccountUsageWindow, ActivitySignal, ContextUsage, KiroAccountUsage,
-    LastTerminalEvent, Observed, TaskProgress, ThreadSnapshot, ThreadState, ThreadTreeNode,
-    TokenUsage,
+    LastRequestTokenUsage, LastTerminalEvent, Observed, TaskProgress, ThreadSnapshot, ThreadState,
+    ThreadTreeNode, TokenUsage,
 };
 use crate::observer::Monitor;
 use crate::ollama::OllamaServerStatus;
@@ -109,6 +109,8 @@ struct ListRow {
     effort: String,
     token_total: String,
     token_total_value: Option<u64>,
+    /// Shown only when the session total is unknown; never aggregated.
+    last_request: Option<String>,
     context_usage: Option<String>,
     task_progress: Option<String>,
     origin_label: String,
@@ -537,7 +539,7 @@ fn claude_token_summary(rows: &[ListRow]) -> (u64, usize) {
 }
 
 /// Claude Code's desktop app records plan utilisation percentages but no reset
-/// time, so the line reports the windows it has plus observed token totals.
+/// time, so the line reports percentages used, their evidence age, and tokens.
 fn claude_usage_line(
     account_usage: &Observed<AccountUsage>,
     tokens: u64,
@@ -550,14 +552,33 @@ fn claude_usage_line(
             .into_iter()
             .flatten()
         {
-            windows.push(account_usage_window_label(window, now));
+            let duration = window
+                .window_minutes
+                .map(account_usage_duration_label)
+                .unwrap_or_else(|| "unknown window".to_string());
+            let used = window
+                .used_percent
+                .map(|used| format!("{:.0}% used", used.clamp(0.0, 100.0)))
+                .unwrap_or_else(|| "unavailable".to_string());
+            windows.push(format!("{duration} {used}"));
         }
     }
-    let plan = if windows.is_empty() {
+    let mut plan = if windows.is_empty() {
         "unavailable".to_string()
     } else {
         windows.join(" · ")
     };
+    let observed_age = account_usage
+        .observed_at
+        .map(|timestamp| format_time_delta(Some(timestamp), now))
+        .unwrap_or_else(|| "unknown age".to_string());
+    if !windows.is_empty()
+        && account_usage
+            .observed_at
+            .is_some_and(|timestamp| now - timestamp > Duration::minutes(30))
+    {
+        plan = format!("(stale) {plan}");
+    }
     let observed = if sessions == 0 {
         "no sessions observed".to_string()
     } else {
@@ -568,7 +589,7 @@ fn claude_usage_line(
             if sessions == 1 { "" } else { "s" }
         )
     };
-    format!("Claude usage: {plan}  •  {observed}")
+    format!("Claude usage: {plan}  •  observed {observed_age}  •  {observed}")
 }
 
 fn usage_lines(
@@ -903,6 +924,9 @@ fn render_agent_card(frame: &mut Frame, area: Rect, row: &ListRow, is_selected: 
     if summary_metrics.is_empty() {
         summary_metrics.push(row.token_total.as_str());
     }
+    if let Some(last_request) = row.last_request.as_deref() {
+        summary_metrics.push(last_request);
+    }
     let summary_metric = summary_metrics.join(" • ");
     lines.push(Line::from(vec![
         Span::styled(
@@ -1104,6 +1128,15 @@ fn render_details_pane(
     lines.push(Line::from(format_token_usage_details(
         &selected.token_usage,
     )));
+    if let Some(details) = format_last_request_details(&selected.last_request_usage) {
+        lines.push(Line::from(Span::styled(
+            "Last request (not a session total)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(details));
+    }
     if selected.context_usage.value.is_some() {
         lines.push(horizontal_divider(inner.width));
         lines.push(Line::from(Span::styled(
@@ -1301,6 +1334,11 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
     let age_label = format_time_delta(last_update_for_thread(thread), now);
     let bucket = bucket_for_state(thread.state.clone());
     let state_label = state_label(thread.state.clone());
+    let token_total_value = thread
+        .token_usage
+        .value
+        .as_ref()
+        .and_then(|usage| usage.total_tokens);
     ListRow {
         thread_id: thread.thread_id.clone(),
         state: thread.state.clone(),
@@ -1310,11 +1348,11 @@ fn build_list_row(thread: &ThreadSnapshot, depth: usize, now: DateTime<Utc>) -> 
         model,
         effort,
         token_total: token_total_label(&thread.token_usage),
-        token_total_value: thread
-            .token_usage
-            .value
-            .as_ref()
-            .and_then(|usage| usage.total_tokens),
+        token_total_value,
+        last_request: token_total_value
+            .is_none()
+            .then(|| last_request_card_label(&thread.last_request_usage))
+            .flatten(),
         context_usage: context_usage_card_label(&thread.context_usage),
         task_progress: task_progress_card_label(&thread.task_progress),
         origin_label,
@@ -1338,6 +1376,44 @@ fn token_total_label(observed: &Observed<TokenUsage>) -> String {
         .map(format_compact_count)
         .unwrap_or_else(|| "?".to_string());
     format!("Tokens {total}")
+}
+
+fn last_request_card_label(observed: &Observed<LastRequestTokenUsage>) -> Option<String> {
+    let usage = observed.value.as_ref()?;
+    Some(if let Some(total) = usage.total_tokens {
+        format!("Last request {}", format_compact_count(total))
+    } else {
+        format!(
+            "Last request I{} O{}",
+            usage
+                .input_tokens
+                .map(format_compact_count)
+                .unwrap_or_else(|| "?".to_string()),
+            usage
+                .output_tokens
+                .map(format_compact_count)
+                .unwrap_or_else(|| "?".to_string()),
+        )
+    })
+}
+
+fn format_last_request_details(observed: &Observed<LastRequestTokenUsage>) -> Option<String> {
+    let usage = observed.value.as_ref()?;
+    let observed_at = observed
+        .observed_at
+        .as_ref()
+        .map(format_timestamp_short)
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(format!(
+        "total={}  input={}  cached input={}  cache-write input={}  output={}  reasoning output={}  observed={observed_at}  (source={})",
+        format_optional_count(usage.total_tokens),
+        format_optional_count(usage.input_tokens),
+        format_optional_count(usage.cached_input_tokens),
+        format_optional_count(usage.cache_write_input_tokens),
+        format_optional_count(usage.output_tokens),
+        format_optional_count(usage.reasoning_output_tokens),
+        source_label(observed),
+    ))
 }
 
 fn context_usage_card_label(observed: &Observed<ContextUsage>) -> Option<String> {
@@ -1484,6 +1560,11 @@ fn provider_for_source_kind(source_kind: Option<&str>) -> String {
         "Claude".to_string()
     } else if source_kind.is_some_and(|kind| kind.starts_with("kiro_")) {
         "Kiro".to_string()
+    } else if matches!(
+        source_kind,
+        Some("copilot_session_state" | "copilot_vscode_chat")
+    ) {
+        "Copilot".to_string()
     } else {
         "Codex".to_string()
     }
@@ -1497,6 +1578,8 @@ fn friendly_source_kind(source_kind: &str) -> &str {
         "claude_code" => "Claude Code",
         "kiro_cli" => "Kiro CLI",
         "kiro_acp" => "Kiro ACP worker",
+        "copilot_session_state" => "Copilot session state",
+        "copilot_vscode_chat" => "VS Code Copilot Chat",
         _ => "Codex",
     }
 }
@@ -1800,6 +1883,7 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: crate::model::Observed::unknown(),
+            last_request_usage: crate::model::Observed::unknown(),
             context_usage: crate::model::Observed::unknown(),
             task_progress: crate::model::Observed::unknown(),
             created_at: None,
@@ -1961,6 +2045,51 @@ mod tests {
     }
 
     #[test]
+    fn last_request_card_is_explicit_and_never_uses_session_total_label() {
+        let observed = Observed {
+            value: Some(LastRequestTokenUsage {
+                input_tokens: Some(23),
+                cached_input_tokens: Some(2),
+                cache_write_input_tokens: None,
+                output_tokens: Some(7),
+                reasoning_output_tokens: None,
+                total_tokens: Some(30),
+            }),
+            source: None,
+            observed_at: None,
+            confidence: crate::model::Confidence::Medium,
+            detail: None,
+        };
+        assert_eq!(
+            last_request_card_label(&observed).as_deref(),
+            Some("Last request 30")
+        );
+        let detail = format_last_request_details(&observed).unwrap();
+        assert!(detail.contains("input=23"));
+        assert!(detail.contains("output=7"));
+        assert!(detail.contains("observed=unknown"));
+
+        let partial = Observed {
+            value: Some(LastRequestTokenUsage {
+                input_tokens: Some(23),
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                output_tokens: None,
+                reasoning_output_tokens: None,
+                total_tokens: None,
+            }),
+            source: None,
+            observed_at: None,
+            confidence: crate::model::Confidence::Medium,
+            detail: None,
+        };
+        assert_eq!(
+            last_request_card_label(&partial).as_deref(),
+            Some("Last request I23 O?")
+        );
+    }
+
+    #[test]
     fn age_prefers_recency_over_updated_over_created() {
         let created = Utc::now() - Duration::seconds(300);
         let updated = created + Duration::seconds(200);
@@ -2025,6 +2154,7 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: crate::model::Observed::unknown(),
+            last_request_usage: crate::model::Observed::unknown(),
             context_usage: crate::model::Observed::unknown(),
             task_progress: crate::model::Observed::unknown(),
             created_at: None,
@@ -2848,6 +2978,7 @@ mod tests {
 
     #[test]
     fn claude_header_aggregates_tokens_across_sessions() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let rows = vec![
             claude_row("claude:a", Some(10_000_000)),
             claude_row("claude:b", Some(1_500_000)),
@@ -2868,13 +2999,32 @@ mod tests {
             }),
             "claude.plan_usage_history",
             None,
-            None,
+            Some(now - Duration::minutes(10)),
         );
-        // The shared formatter reports remaining, so 20% used renders as 80%.
-        let line = claude_usage_line(&plan, 11_500_000, 2, Utc::now());
-        assert!(line.contains("5h 80%"), "{line}");
-        assert!(line.contains("Weekly 97%"), "{line}");
+        let line = claude_usage_line(&plan, 11_500_000, 2, now);
+        assert!(line.contains("5h 20% used"), "{line}");
+        assert!(line.contains("Weekly 3% used"), "{line}");
+        assert!(line.contains("observed 10m"), "{line}");
         assert!(line.contains("2 sessions"), "{line}");
+
+        let stale_plan = Observed::from_value(
+            plan.value.clone(),
+            "claude.plan_usage_history",
+            None,
+            Some(now - Duration::minutes(31)),
+        );
+        let stale = claude_usage_line(&stale_plan, 11_500_000, 2, now);
+        assert!(stale.contains("(stale) 5h 20% used"), "{stale}");
+        assert!(stale.contains("observed 31m"), "{stale}");
+
+        let unknown_age_plan =
+            Observed::from_value(plan.value.clone(), "claude.plan_usage_history", None, None);
+        let unknown_age = claude_usage_line(&unknown_age_plan, 11_500_000, 2, now);
+        assert!(
+            unknown_age.contains("observed unknown age"),
+            "{unknown_age}"
+        );
+        assert!(!unknown_age.contains("(stale)"), "{unknown_age}");
 
         // A session without usage evidence still counts as a session, adding zero
         // rather than dropping the row or inventing a total.
@@ -2901,7 +3051,10 @@ mod tests {
         assert_eq!(claude_token_summary(&codex_rows), (0, 0));
         // With no plan history and no sessions, both halves say so plainly.
         let empty = claude_usage_line(&Observed::unknown(), 0, 0, Utc::now());
-        assert_eq!(empty, "Claude usage: unavailable  •  no sessions observed");
+        assert_eq!(
+            empty,
+            "Claude usage: unavailable  •  observed unknown age  •  no sessions observed"
+        );
 
         let single = claude_usage_line(&Observed::unknown(), 5, 1, Utc::now());
         assert!(single.contains("1 session") && !single.contains("1 sessions"));

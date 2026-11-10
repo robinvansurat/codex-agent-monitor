@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod cli;
 pub mod config;
+pub mod copilot;
 pub mod db;
 pub mod kiro;
 pub mod kiro_usage;

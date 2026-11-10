@@ -26,6 +26,7 @@ fn main() -> Result<()> {
     )?;
     monitor.set_claude_home(cli.shared.claude_home.clone())?;
     monitor.set_claude_usage_file(cli.shared.claude_usage_file.clone());
+    monitor.set_copilot_home(cli.shared.copilot_home.clone())?;
     let command = selected_command(&cli);
 
     match command {

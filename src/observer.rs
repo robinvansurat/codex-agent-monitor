@@ -14,14 +14,17 @@ use crate::cli::{FilterOpts, Provider, ThreadStateFilter};
 use crate::config::{
     load_agent_config_value, load_config, resolve_codex_home, sqlite_home, SqliteHome,
 };
+use crate::copilot::{
+    self, CopilotLastRequestUsage, CopilotThreadRecord, CopilotTokenUsage, UsageSnapshotStatus,
+};
 use crate::db::DbThreadRecord;
 use crate::kiro::{self, KiroThreadRecord};
 use crate::kiro_usage::{self, UsageClient};
 use crate::model::{
     AccountUsage, AccountUsageWindow, ActivitySignal, Confidence, ContextUsage, EvidenceSource,
-    KiroAccountUsage, LastTerminalEvent, ModelSpec, ModelSummary, Observed, ProbeEnvironment,
-    ProbeOutput, QueryInfo, TaskProgress, ThreadActivity, ThreadEvidence, ThreadSnapshot,
-    ThreadState, TokenUsage,
+    KiroAccountUsage, LastRequestTokenUsage, LastTerminalEvent, ModelSpec, ModelSummary, Observed,
+    ProbeEnvironment, ProbeOutput, QueryInfo, TaskProgress, ThreadActivity, ThreadEvidence,
+    ThreadSnapshot, ThreadState, TokenUsage,
 };
 use crate::ollama::{self, OllamaServerStatus, OllamaThreadRecord};
 use crate::rollout::{
@@ -37,6 +40,7 @@ pub struct Monitor {
     pub ollama_db: Option<PathBuf>,
     pub claude_home: PathBuf,
     pub claude_usage_file: Option<PathBuf>,
+    pub copilot_home: PathBuf,
     kiro_home_explicit: bool,
     pub provider: Provider,
     pub config: crate::config::ConfigContext,
@@ -249,8 +253,12 @@ impl Monitor {
         let (resolved_kiro_home, kiro_home_explicit) =
             kiro::resolve_kiro_home(kiro_home.as_deref())?;
         let (resolved_claude_home, _) = claude::resolve_claude_home(None)?;
+        let (resolved_copilot_home, _) = copilot::resolve_copilot_home(None)?;
         let mut startup_warnings = Vec::new();
-        let config = if matches!(provider, Provider::Claude | Provider::Kiro) {
+        let config = if matches!(
+            provider,
+            Provider::Claude | Provider::Kiro | Provider::Copilot
+        ) {
             crate::config::ConfigContext {
                 global: None,
                 agents_dir: None,
@@ -299,12 +307,13 @@ impl Monitor {
             ollama_db: ollama_db.map(PathBuf::from),
             claude_home: resolved_claude_home,
             claude_usage_file: None,
+            copilot_home: resolved_copilot_home,
             kiro_home_explicit,
             provider: provider.clone(),
             config,
             environment: detect_environment(!matches!(
                 provider,
-                Provider::Claude | Provider::Kiro | Provider::Ollama
+                Provider::Claude | Provider::Kiro | Provider::Ollama | Provider::Copilot
             )),
             rollout_cache: HashMap::new(),
             startup_warnings,
@@ -322,6 +331,13 @@ impl Monitor {
 
     pub fn set_claude_usage_file(&mut self, path: Option<String>) {
         self.claude_usage_file = path.map(PathBuf::from);
+    }
+
+    /// `--copilot-home`, then `COPILOT_HOME`, then `~/.copilot`.
+    pub fn set_copilot_home(&mut self, copilot_home: Option<String>) -> Result<()> {
+        let (home, _) = copilot::resolve_copilot_home(copilot_home.as_deref())?;
+        self.copilot_home = home;
+        Ok(())
     }
 
     pub fn probe_snapshot(
@@ -413,7 +429,8 @@ impl Monitor {
         let mut claude_paths = HashMap::<String, PathBuf>::new();
         let mut claude_account_usage = Observed::<AccountUsage>::unknown();
         if matches!(self.provider, Provider::Claude | Provider::All) {
-            claude_account_usage = claude::read_plan_usage(self.claude_usage_file.as_deref());
+            claude_account_usage =
+                claude::read_plan_usage_or_statusline(self.claude_usage_file.as_deref());
             let claude_snapshot = claude::read_snapshot(&self.claude_home);
             warnings.extend(claude_snapshot.warnings);
             for thread in claude_snapshot.threads {
@@ -499,6 +516,45 @@ impl Monitor {
                 }
                 rollouts.insert(id.clone(), kiro_rollout(&kiro_thread));
                 db_threads.push(kiro_db_record(&kiro_thread));
+            }
+        }
+        let mut copilot_paths = HashMap::<String, PathBuf>::new();
+        let mut copilot_requested = HashMap::<String, Observed<ModelSpec>>::new();
+        let mut copilot_tokens = HashMap::<String, Observed<TokenUsage>>::new();
+        let mut copilot_last_request = HashMap::<String, Observed<LastRequestTokenUsage>>::new();
+        let mut copilot_state_detail = HashMap::<String, String>::new();
+        if self.provider.includes_copilot() {
+            // Copilot CLI and Desktop share this source; each session is read once.
+            let copilot_snapshot = copilot::read_snapshot(&self.copilot_home);
+            warnings.extend(copilot_snapshot.warnings);
+            for thread in copilot_snapshot.threads {
+                let id = thread.id.clone();
+                if db_threads.iter().any(|existing| existing.id == id) {
+                    continue;
+                }
+                copilot_paths.insert(id.clone(), thread.path.clone());
+                if let Some(requested) = copilot_requested_model(&thread) {
+                    copilot_requested.insert(id.clone(), requested);
+                }
+                let tokens = thread.token_usage.as_ref().map(copilot_token_observation);
+                let cumulative_proven = tokens
+                    .as_ref()
+                    .and_then(|tokens| tokens.value.as_ref())
+                    .is_some_and(|usage| usage.total_tokens.is_some());
+                if let Some(tokens) = tokens {
+                    copilot_tokens.insert(id.clone(), tokens);
+                }
+                // The last request is shown only while current cumulative
+                // usage is not provable, and is never merged into token_usage.
+                if !cumulative_proven {
+                    if let Some(last) = thread.last_request_usage.as_ref() {
+                        copilot_last_request
+                            .insert(id.clone(), copilot_last_request_observation(last));
+                    }
+                }
+                copilot_state_detail.insert(id.clone(), thread.state_detail.clone());
+                rollouts.insert(id.clone(), copilot_rollout(&thread));
+                db_threads.push(copilot_db_record(&thread));
             }
         }
         let all_threads = db_threads;
@@ -593,13 +649,18 @@ impl Monitor {
                 }
             }
 
-            let requested = requested_model(thread, rollouts.get(&thread.id));
-            // Codex config defaults describe Codex threads only; an Ollama row has
-            // no Codex configuration behind it.
-            let configured = if thread
-                .source_kind
-                .as_deref()
-                .is_some_and(|kind| kind.starts_with("ollama_"))
+            let is_copilot = is_copilot_source(thread.source_kind.as_deref());
+            let requested = copilot_requested
+                .get(&thread.id)
+                .cloned()
+                .unwrap_or_else(|| requested_model(thread, rollouts.get(&thread.id)));
+            // Codex config defaults describe Codex threads only; an Ollama or
+            // Copilot row has no Codex configuration behind it.
+            let configured = if is_copilot
+                || thread
+                    .source_kind
+                    .as_deref()
+                    .is_some_and(|kind| kind.starts_with("ollama_"))
             {
                 Observed::unknown()
             } else {
@@ -609,8 +670,10 @@ impl Monitor {
                 .source_kind
                 .as_deref()
                 .is_some_and(|kind| kind.starts_with("kiro_"));
+            // The runtime overlay carries Codex app-server facts only.
+            let runtime_applies = !is_kiro && !is_copilot;
             let mut effective = Observed::unknown();
-            if !is_kiro {
+            if runtime_applies {
                 if let Some(value) = runtime.effective_model.get(&thread.id) {
                     effective = value.clone();
                 }
@@ -654,6 +717,9 @@ impl Monitor {
             let lifecycle_at = parsed_rollout.and_then(|rollout| rollout.final_state_at);
             evidence.state.observed_at = lifecycle_at;
             evidence.state.confidence = state_confidence(&thread_state, lifecycle_at);
+            if let Some(detail) = copilot_state_detail.get(&thread.id) {
+                evidence.state.detail = Some(detail.clone());
+            }
             let nickname = evidence.nickname.value.clone();
             let role = evidence.role.value.clone();
             let parent_thread_id = evidence.parent_thread_id.value.clone();
@@ -676,18 +742,25 @@ impl Monitor {
                     configured,
                     requested,
                     effective,
-                    rerouted_from: if is_kiro {
-                        None
-                    } else {
+                    rerouted_from: if runtime_applies {
                         runtime.rerouted_from.get(&thread.id).cloned()
-                    },
-                    reroute_reason: if is_kiro {
-                        None
                     } else {
+                        None
+                    },
+                    reroute_reason: if runtime_applies {
                         runtime.reroute_reason.get(&thread.id).cloned()
+                    } else {
+                        None
                     },
                 },
-                token_usage: token_usage_observation(rollouts.get(&thread.id)),
+                token_usage: copilot_tokens
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_else(|| token_usage_observation(rollouts.get(&thread.id))),
+                last_request_usage: copilot_last_request
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_else(Observed::unknown),
                 context_usage: kiro_context_usage
                     .get(&thread.id)
                     .cloned()
@@ -706,6 +779,11 @@ impl Monitor {
                     .or_else(|| kiro_paths.get(&thread.id).map(|p| p.display().to_string()))
                     .or_else(|| {
                         claude_paths
+                            .get(&thread.id)
+                            .map(|p| p.display().to_string())
+                    })
+                    .or_else(|| {
+                        copilot_paths
                             .get(&thread.id)
                             .map(|p| p.display().to_string())
                     }),
@@ -764,6 +842,7 @@ impl Monitor {
                         Provider::Claude => "claude",
                         Provider::Kiro => "kiro",
                         Provider::Ollama => "ollama",
+                        Provider::Copilot => "copilot",
                         Provider::All => "all",
                     }
                     .to_string(),
@@ -873,6 +952,173 @@ fn claude_rollout(thread: &ClaudeThreadRecord) -> RolloutParseResult {
     }
 }
 
+fn is_copilot_source(source_kind: Option<&str>) -> bool {
+    matches!(
+        source_kind,
+        Some(copilot::SOURCE_KIND | copilot::VSCODE_SOURCE_KIND)
+    )
+}
+
+fn copilot_db_record(thread: &CopilotThreadRecord) -> crate::db::DbThreadRecord {
+    crate::db::DbThreadRecord {
+        id: thread.id.clone(),
+        rollout_path: None,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+        recency_at: thread.recency_at,
+        source: None,
+        thread_source: None,
+        // The requested model is reported through Copilot-specific evidence.
+        model: None,
+        reasoning_effort: None,
+        agent_nickname: None,
+        agent_role: None,
+        agent_path: None,
+        cwd: thread.cwd.clone(),
+        source_kind: Some(thread.source_kind.clone()),
+        raw: HashMap::new(),
+    }
+}
+
+fn copilot_rollout(thread: &CopilotThreadRecord) -> RolloutParseResult {
+    let final_state = match thread.state {
+        ThreadState::Running => RolloutStateHint::Running,
+        ThreadState::Idle => RolloutStateHint::Idle,
+        ThreadState::Unknown => RolloutStateHint::Unknown,
+    };
+    RolloutParseResult {
+        activity: thread.activity.clone(),
+        final_state,
+        final_state_at: thread.lifecycle_at,
+        latest_lifecycle_at: thread.lifecycle_at,
+        latest_activity_at: thread.updated_at,
+        ..RolloutParseResult::default()
+    }
+}
+
+fn copilot_requested_model(thread: &CopilotThreadRecord) -> Option<Observed<ModelSpec>> {
+    let model = thread.model.clone()?;
+    Some(Observed {
+        value: Some(ModelSpec {
+            model: Some(model),
+            reasoning_effort: None,
+        }),
+        source: Some(EvidenceSource {
+            kind: if thread.source_kind == copilot::VSCODE_SOURCE_KIND {
+                "copilot.vscode_chat.model".to_string()
+            } else {
+                "copilot.session_state.model".to_string()
+            },
+            detail: Some(if thread.source_kind == copilot::VSCODE_SOURCE_KIND {
+                "modelId recorded for a request explicitly associated with GitHub Copilot Chat".to_string()
+            } else {
+                "latest of session.start selectedModel, session.model_change, and session.shutdown currentModel".to_string()
+            }),
+        }),
+        observed_at: thread.model_observed_at,
+        confidence: Confidence::Medium,
+        detail: Some(format!(
+            "requested/selected model name as persisted by Copilot; an alias is not proof of the upstream model; models observed in this session: {}",
+            thread.models.join(", ")
+        )),
+    })
+}
+
+fn copilot_token_observation(usage: &CopilotTokenUsage) -> Observed<TokenUsage> {
+    let current_usage_proven = usage.status == UsageSnapshotStatus::VerifiedReceipts
+        || (usage.status == UsageSnapshotStatus::Latest && usage.shutdown_count == 1);
+    let detail = match usage.status {
+        UsageSnapshotStatus::VerifiedReceipts => "cumulative usage summed from a complete, contiguous set of distinct persisted usage receipts; not billing".to_string(),
+        UsageSnapshotStatus::Superseded => {
+            "historical snapshot: the session continued after this session.shutdown (for example via session.resume), so current cumulative usage is unknown".to_string()
+        }
+        UsageSnapshotStatus::Uncertain => {
+            "unreadable or truncated records follow this session.shutdown snapshot, so it may not be current".to_string()
+        }
+        UsageSnapshotStatus::Latest if usage.shutdown_count > 1 => format!(
+            "latest of {} session.shutdown snapshots; cumulative usage continuity is not verified",
+            usage.shutdown_count
+        ),
+        UsageSnapshotStatus::Latest => "cumulative usage recorded at session.shutdown".to_string(),
+    };
+    Observed {
+        value: current_usage_proven.then(|| TokenUsage {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cache_read_tokens,
+            cache_write_input_tokens: usage.cache_write_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage.reasoning_tokens,
+            // Cache and reasoning counters can overlap input/output, so the
+            // total is input + output only. currentTokens is context
+            // occupancy and is excluded.
+            total_tokens: input_output_total(usage.input_tokens, usage.output_tokens),
+            context_window: None,
+        }),
+        source: Some(if usage.status == UsageSnapshotStatus::VerifiedReceipts {
+            EvidenceSource {
+                kind: "copilot.session_usage_record".to_string(),
+                detail: Some("cumulative input and output from verified persisted receipts; not billing".to_string()),
+            }
+        } else {
+            EvidenceSource {
+                kind: "copilot.session_shutdown.model_metrics".to_string(),
+                detail: Some(format!(
+                    "modelMetrics usage counters summed across models: {}",
+                    usage.models.join(", ")
+                )),
+            }
+        }),
+        observed_at: usage.observed_at,
+        confidence: if current_usage_proven {
+            Confidence::Medium
+        } else {
+            Confidence::Low
+        },
+        detail: Some(format!(
+            "{detail}; total_tokens is input + output only, because cache and reasoning counters can overlap them"
+        )),
+    }
+}
+
+/// `input + output`, only when both are known and the sum fits in `u64`.
+fn input_output_total(input: Option<u64>, output: Option<u64>) -> Option<u64> {
+    input?.checked_add(output?)
+}
+
+fn copilot_last_request_observation(
+    usage: &CopilotLastRequestUsage,
+) -> Observed<LastRequestTokenUsage> {
+    let mut detail = "last request only, not a session total; never added to session or global totals; total_tokens is input + output only, because cache and reasoning counters can overlap them".to_string();
+    if usage.followed_by_unverified_records {
+        detail.push_str(
+            "; unreadable or invalid records follow this usage record, so a newer request may exist",
+        );
+    }
+    Observed {
+        value: Some(LastRequestTokenUsage {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cache_read_tokens,
+            cache_write_input_tokens: usage.cache_write_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage.reasoning_tokens,
+            total_tokens: input_output_total(usage.input_tokens, usage.output_tokens),
+        }),
+        source: Some(EvidenceSource {
+            kind: "copilot.session_usage_record".to_string(),
+            detail: Some(
+                "usage counters of the latest valid persisted session.usage_record".to_string(),
+            ),
+        }),
+        observed_at: usage.observed_at,
+        confidence: if usage.followed_by_unverified_records {
+            Confidence::Low
+        } else {
+            Confidence::Medium
+        },
+        detail: Some(detail),
+    }
+}
+
 fn ollama_rollout(thread: &OllamaThreadRecord) -> RolloutParseResult {
     let final_state = match thread.state {
         ThreadState::Running => RolloutStateHint::Running,
@@ -929,6 +1175,9 @@ fn thread_id_matches(id: &str, filter: &str) -> bool {
         || id.strip_prefix("kiro:").is_some_and(|raw| raw == filter)
         || id.strip_prefix("ollama:").is_some_and(|raw| raw == filter)
         || id.strip_prefix("claude:").is_some_and(|raw| raw == filter)
+        || id
+            .strip_prefix(copilot::ID_PREFIX)
+            .is_some_and(|raw| raw == filter)
 }
 
 fn account_usage_observation(
@@ -1322,8 +1571,11 @@ fn activity_signal_observation_at(
             .flatten()
             .max()
     });
+    let is_copilot = is_copilot_source(thread.source_kind.as_deref());
     let fallback_source = if is_kiro {
         "kiro.persisted-state"
+    } else if is_copilot {
+        "copilot.session_state"
     } else {
         "threads-table"
     };
@@ -1353,6 +1605,8 @@ fn activity_signal_observation_at(
     let recent = timestamp >= now - ChronoDuration::minutes(FRESHNESS_WINDOW_MINUTES);
     let source = if is_kiro && source == "rollout.activity" {
         "kiro.activity"
+    } else if is_copilot && source == "rollout.activity" {
+        "copilot.activity"
     } else {
         source
     };
@@ -1374,7 +1628,10 @@ fn activity_signal_observation_at(
             ),
         }),
         observed_at: Some(timestamp),
-        confidence: if matches!(source, "threads-table" | "kiro.persisted-state") {
+        confidence: if matches!(
+            source,
+            "threads-table" | "kiro.persisted-state" | "copilot.session_state"
+        ) {
             Confidence::Low
         } else {
             Confidence::Medium
@@ -1422,12 +1679,25 @@ fn thread_evidence(
         .as_deref()
         .is_some_and(|kind| kind.starts_with("kiro_"));
     let ollama_api_source = thread.source_kind.as_deref() == Some("ollama_api");
+    let copilot_source = is_copilot_source(thread.source_kind.as_deref());
     let session_source = if kiro_source {
         "kiro.session"
     } else if ollama_api_source {
         "ollama.api.ps"
+    } else if copilot_source {
+        "copilot.session_state"
     } else {
         "persisted-session"
+    };
+    // Kiro and Copilot rows carry cwd/source_kind from their own session files.
+    let (record_source, record_detail) = if kiro_source {
+        ("kiro.session", "from Kiro session")
+    } else if thread.source_kind.as_deref() == Some(copilot::VSCODE_SOURCE_KIND) {
+        ("copilot.vscode_chat", "from VS Code Copilot Chat session")
+    } else if copilot_source {
+        ("copilot.session_state", "from Copilot session-state events")
+    } else {
+        ("threads-table", "from threads table")
     };
 
     let latest_activity = activity.last().cloned().map(|activity| {
@@ -1511,6 +1781,8 @@ fn thread_evidence(
                     "derived from Kiro lifecycle".to_string()
                 } else if ollama_api_source {
                     "model resident in the local Ollama server".to_string()
+                } else if copilot_source {
+                    "derived from persisted Copilot session and assistant turn events".to_string()
                 } else {
                     "derived from rollout lifecycle".to_string()
                 }),
@@ -1532,16 +1804,8 @@ fn thread_evidence(
             .map(|value| {
                 Observed::from_value(
                     Some(value),
-                    if kiro_source {
-                        "kiro.session"
-                    } else {
-                        "threads-table"
-                    },
-                    Some(if kiro_source {
-                        "from Kiro session".to_string()
-                    } else {
-                        "from threads table".to_string()
-                    }),
+                    record_source,
+                    Some(record_detail.to_string()),
                     None,
                 )
             })
@@ -1550,16 +1814,8 @@ fn thread_evidence(
             .map(|value| {
                 Observed::from_value(
                     Some(value),
-                    if kiro_source {
-                        "kiro.session"
-                    } else {
-                        "threads-table"
-                    },
-                    Some(if kiro_source {
-                        "from Kiro session".to_string()
-                    } else {
-                        "from threads table".to_string()
-                    }),
+                    record_source,
+                    Some(record_detail.to_string()),
                     None,
                 )
             })
@@ -1776,6 +2032,158 @@ mod tests {
     }
 
     #[test]
+    fn copilot_noncurrent_shutdown_snapshots_do_not_expose_token_counters() {
+        for (status, shutdown_count) in [
+            (UsageSnapshotStatus::Superseded, 1),
+            (UsageSnapshotStatus::Uncertain, 1),
+            (UsageSnapshotStatus::Latest, 2),
+        ] {
+            let observed = copilot_token_observation(&CopilotTokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                models: vec!["model-a".into()],
+                observed_at: None,
+                status,
+                shutdown_count,
+            });
+            assert!(observed.value.is_none());
+            assert!(observed.detail.is_some());
+        }
+        let current = copilot_token_observation(&CopilotTokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            models: vec!["model-a".into()],
+            observed_at: None,
+            status: UsageSnapshotStatus::Latest,
+            shutdown_count: 1,
+        });
+        assert_eq!(current.value.as_ref().unwrap().input_tokens, Some(100));
+        assert_eq!(current.value.as_ref().unwrap().total_tokens, Some(120));
+    }
+
+    fn copilot_shutdown(
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        reasoning: Option<u64>,
+    ) -> CopilotTokenUsage {
+        CopilotTokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: None,
+            reasoning_tokens: reasoning,
+            models: vec!["model-a".into()],
+            observed_at: None,
+            status: UsageSnapshotStatus::Latest,
+            shutdown_count: 1,
+        }
+    }
+
+    #[test]
+    fn copilot_latest_shutdown_total_is_input_plus_output_only() {
+        let shutdown = copilot_shutdown(Some(10), Some(4), Some(7), Some(3));
+        let usage = copilot_token_observation(&shutdown).value.unwrap();
+        assert_eq!(usage.total_tokens, Some(14));
+        assert_eq!(usage.cached_input_tokens, Some(7));
+        assert_eq!(usage.reasoning_output_tokens, Some(3));
+
+        let missing_output = copilot_shutdown(Some(10), None, None, None);
+        let usage = copilot_token_observation(&missing_output).value.unwrap();
+        assert_eq!(usage.total_tokens, None);
+
+        let overflow = copilot_shutdown(Some(u64::MAX), Some(1), None, None);
+        let usage = copilot_token_observation(&overflow).value.unwrap();
+        assert_eq!(usage.total_tokens, None);
+        assert_eq!(usage.input_tokens, Some(u64::MAX));
+        assert_eq!(usage.output_tokens, Some(1));
+    }
+
+    #[test]
+    fn copilot_verified_receipt_total_has_provider_evidence_and_excludes_overlapping_counters() {
+        let usage = copilot_token_observation(&CopilotTokenUsage {
+            input_tokens: Some(198_069),
+            output_tokens: Some(1_248),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            models: vec!["model-a".into()],
+            observed_at: None,
+            status: UsageSnapshotStatus::VerifiedReceipts,
+            shutdown_count: 2,
+        });
+        let value = usage.value.unwrap();
+        assert_eq!(value.total_tokens, Some(199_317));
+        assert_eq!(value.cached_input_tokens, None);
+        assert_eq!(usage.source.unwrap().kind, "copilot.session_usage_record");
+        assert!(usage.detail.unwrap().contains("not billing"));
+    }
+
+    fn copilot_request(
+        input: Option<u64>,
+        output: Option<u64>,
+        unverified: bool,
+    ) -> CopilotLastRequestUsage {
+        CopilotLastRequestUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: Some(2),
+            cache_write_tokens: None,
+            reasoning_tokens: Some(1),
+            observed_at: Some(at(1_720_000_000)),
+            followed_by_unverified_records: unverified,
+        }
+    }
+
+    #[test]
+    fn copilot_last_request_is_labeled_and_totals_input_plus_output_only() {
+        let request = copilot_request(Some(8), Some(5), false);
+        let observed = copilot_last_request_observation(&request);
+        let usage = observed.value.as_ref().unwrap();
+        assert_eq!(usage.total_tokens, Some(13));
+        assert_eq!(usage.cached_input_tokens, Some(2));
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.reasoning_output_tokens, Some(1));
+        assert_eq!(
+            observed.source.as_ref().unwrap().kind,
+            "copilot.session_usage_record"
+        );
+        assert_eq!(observed.observed_at, Some(at(1_720_000_000)));
+        assert_eq!(observed.confidence, Confidence::Medium);
+        assert!(observed
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("not a session total"));
+
+        let overflow = copilot_request(Some(u64::MAX), Some(1), false);
+        let usage = copilot_last_request_observation(&overflow).value.unwrap();
+        assert_eq!(usage.total_tokens, None);
+        assert_eq!(usage.input_tokens, Some(u64::MAX));
+
+        let partial = copilot_request(None, Some(5), false);
+        let usage = copilot_last_request_observation(&partial).value.unwrap();
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.total_tokens, None);
+
+        let request = copilot_request(Some(1), Some(1), true);
+        let unverified = copilot_last_request_observation(&request);
+        assert_eq!(unverified.confidence, Confidence::Low);
+        assert!(unverified
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("newer request may exist"));
+    }
+
+    #[test]
     fn applies_state_filter_matches_aliases() {
         assert!(crate::observer::applies_state(
             &ThreadStateFilter::Running,
@@ -1887,6 +2295,7 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: Observed::unknown(),
+            last_request_usage: Observed::unknown(),
             context_usage: Observed::unknown(),
             task_progress: Observed::unknown(),
             created_at: None,
@@ -2232,6 +2641,7 @@ mod tests {
                 reroute_reason: None,
             },
             token_usage: Observed::unknown(),
+            last_request_usage: Observed::unknown(),
             context_usage: Observed::unknown(),
             task_progress: Observed::unknown(),
             created_at: None,
